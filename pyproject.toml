@@ -15,6 +15,11 @@ dependencies = [
     "mcp>=2,<3",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
 [project.scripts]
 claude-code-bridge = "claude_code_bridge.__main__:main"
 claude-code-bridge-cli = "claude_code_bridge.cli:main"

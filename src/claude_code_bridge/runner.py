@@ -38,6 +38,23 @@ class BridgeError(Exception):
     """Raised for policy violations and validation failures."""
 
 
+# Held between spawn and job termination so we can `.poll()` the child
+# and reap the zombie the bash wrapper leaves behind when it exits.
+# Without this the wrapper stays in the MCP server's process table as
+# <defunct> and `os.kill(pid, 0)` on it succeeds — which is what
+# Cowork's first MCP-side call to Test 1 tripped on: the job never
+# transitioned out of "running", the exit_code file sat on disk
+# unread, and the one-run-per-cwd lock never cleared.
+#
+# The dict is populated on spawn and drained by `_reap_popen`. Only
+# the process that spawned the child can reap it, so this is only
+# useful within a single MCP server run — but that is exactly the
+# case where the zombie problem showed up. A restart of the MCP
+# server hands the wrapper (or its remains) to launchd, which does
+# the reap on its own.
+_LIVE_POPENS: dict[str, "subprocess.Popen[bytes]"] = {}
+
+
 @dataclass
 class JobView:
     job_id: str
@@ -129,23 +146,72 @@ def _save_meta(meta_path: Path, meta: dict) -> None:
     meta_path.write_text(json.dumps(meta, indent=2))
 
 
+def _reap_popen(job_id: str) -> int | None:
+    """Poll our recorded Popen (if any) and drop it once it has exited.
+
+    Returns the exit code if the process has now terminated (which also
+    reaps the zombie), None if it is still running or we don't hold a
+    Popen for this job.
+    """
+    proc = _LIVE_POPENS.get(job_id)
+    if proc is None:
+        return None
+    code = proc.poll()
+    if code is not None:
+        _LIVE_POPENS.pop(job_id, None)
+    return code
+
+
 def _finalize_if_dead(meta_path: Path, meta: dict) -> dict:
+    """Mark a job finished if the evidence on disk says it is.
+
+    Order of evidence, most to least authoritative:
+      1. `ended_at` already recorded → nothing to do.
+      2. `exit_code` file exists → wrapper reached its final `echo $?`,
+         so CC exited cleanly and the job is done. This is checked
+         BEFORE the pid because a zombie satisfies `os.kill(pid, 0)`
+         (Cowork's 2026-09-02 bug report), and a pid check first would
+         report "running" forever with the exit_code file sitting on
+         disk unread.
+      3. Our Popen recorded on spawn returns from `.poll()` with a
+         non-None code → wrapper has exited but for some reason (kill,
+         write failure) never wrote `exit_code`. This also reaps the
+         zombie.
+      4. Neither file nor Popen, and the pid is dead → wrapper was
+         killed and cleaned up out from under us. Mark done, exit
+         code unknown.
+
+    Anything else → still running.
+    """
     if meta.get("ended_at"):
         return meta
-    pid = meta.get("pid")
-    if pid and _pid_alive(pid):
-        return meta
+
+    job_id = meta.get("job_id", "")
+    exit_path = meta_path.parent / "exit_code"
+
+    exit_code: int | str | None = None
+    if exit_path.is_file():
+        raw = exit_path.read_text().strip()
+        try:
+            exit_code = int(raw)
+        except ValueError:
+            exit_code = raw or "unknown"
+        # A file on disk means done; opportunistically reap our Popen
+        # so it doesn't linger as a zombie.
+        _reap_popen(job_id)
+    else:
+        popen_code = _reap_popen(job_id)
+        if popen_code is not None:
+            exit_code = popen_code
+        else:
+            pid = meta.get("pid")
+            if pid and _pid_alive(pid):
+                return meta  # still running
+            exit_code = "unknown"
+
     meta["ended_at"] = _now_iso()
     meta["ended_ts"] = time.time()
-    # Read exit code the bash wrapper wrote when CC exited.
-    exit_path = meta_path.parent / "exit_code"
-    if exit_path.is_file():
-        try:
-            meta["exit_code"] = int(exit_path.read_text().strip())
-        except ValueError:
-            meta["exit_code"] = exit_path.read_text().strip() or "unknown"
-    else:
-        meta["exit_code"] = meta.get("exit_code", "unknown")
+    meta["exit_code"] = exit_code
     _save_meta(meta_path, meta)
     return meta
 
@@ -156,12 +222,12 @@ def _active_in_cwd(cwd: Path) -> str | None:
         meta = json.loads(meta_path.read_text())
         if meta.get("cwd") != cwd_str:
             continue
-        if meta.get("ended_at"):
-            continue
-        pid = meta.get("pid")
-        if pid and _pid_alive(pid):
+        # Finalize first, then check ended_at — a zombie wrapper with
+        # an exit_code file on disk would otherwise show as running
+        # forever and hold the cwd lock indefinitely.
+        meta = _finalize_if_dead(meta_path, meta)
+        if not meta.get("ended_at"):
             return meta["job_id"]
-        _finalize_if_dead(meta_path, meta)
     return None
 
 
@@ -197,7 +263,7 @@ def _validate_cwd(cwd: str) -> Path:
     return cwd_p
 
 
-def _spawn(cmd: list[str], cwd: Path, run_dir: Path, prompt: str) -> int:
+def _spawn(cmd: list[str], cwd: Path, run_dir: Path, prompt: str, job_id: str) -> int:
     """Spawn CC in the background and capture its eventual exit code.
 
     Uses a `bash -c '<cmd>; echo $? > exit_code'` wrapper so the exit
@@ -205,6 +271,12 @@ def _spawn(cmd: list[str], cwd: Path, run_dir: Path, prompt: str) -> int:
     available if the launcher process waits, and this launcher returns
     immediately. The recorded pid is the wrapper bash pid, which lives
     exactly as long as the CC session it wraps.
+
+    Also records the Popen in `_LIVE_POPENS` so the status-path can
+    `.poll()` and reap the wrapper zombie. Without that, a long-running
+    MCP server accumulates <defunct> processes and `os.kill(pid, 0)`
+    keeps returning success — the bug Cowork's first MCP-side call to
+    Test 1 hit.
 
     The prompt is piped to stdin (see `_cc_command` for why not argv).
     """
@@ -222,6 +294,7 @@ def _spawn(cmd: list[str], cwd: Path, run_dir: Path, prompt: str) -> int:
         stderr=stderr_f,
         start_new_session=True,
     )
+    _LIVE_POPENS[job_id] = proc
     # Write the prompt and close stdin so CC sees EOF and starts working.
     # Popen won't block on this write for prompts under the pipe buffer size
     # (64KB on macOS); larger prompts would need a background writer.
@@ -256,7 +329,7 @@ def start_run(task_file: str, cwd: str) -> str:
     pre_bytes = tf.read_bytes()
     (run_dir / "pre.txt").write_bytes(pre_bytes)
 
-    pid = _spawn(cmd, cwd_p, run_dir, prompt)
+    pid = _spawn(cmd, cwd_p, run_dir, prompt, job_id)
 
     meta = {
         "job_id": job_id,
@@ -309,7 +382,7 @@ def start_ask(prev_job_id: str, prompt: str) -> str:
     pre_bytes = task_file.read_bytes() if task_file.is_file() else b""
     (run_dir / "pre.txt").write_bytes(pre_bytes)
 
-    pid = _spawn(cmd, cwd_p, run_dir, prompt)
+    pid = _spawn(cmd, cwd_p, run_dir, prompt, job_id)
 
     meta = {
         "job_id": job_id,
@@ -365,12 +438,12 @@ def list_jobs() -> list[JobView]:
 
 
 def is_running(view: JobView) -> bool:
-    pid = view.meta.get("pid")
-    if not pid:
-        return False
-    if view.meta.get("ended_at"):
-        return False
-    return _pid_alive(pid)
+    # `load_job` runs `_finalize_if_dead` before handing back the view,
+    # so `ended_at` is the authoritative signal. Do NOT re-check the
+    # pid here — a zombie wrapper satisfies `os.kill(pid, 0)` and would
+    # flip a job that already finished back to "running" (the
+    # regression Cowork reported 2026-09-02).
+    return not view.meta.get("ended_at")
 
 
 def elapsed(view: JobView) -> float:
