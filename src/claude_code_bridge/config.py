@@ -38,15 +38,13 @@ PERMISSION_MODE = "default"
 #
 # The list covers reading, editing, task tracking, tests/builds, and the
 # git operations that don't publish. It does NOT include git push, package
-# installs, network fetches beyond WebFetch/WebSearch (which are Claude's
-# own audited tools), or a general shell escape.
+# installs, raw network fetches, or a general shell escape.
 ALLOWED_TOOLS = [
     # Read-only tools
     "Read",
     "Glob",
     "Grep",
-    "WebFetch",
-    "WebSearch",
+    # WebFetch/WebSearch deliberately absent — Cowork does web; headless CC gets no network beyond git (Chris, 2026-09-02).
     # File edits
     "Edit",
     "Write",

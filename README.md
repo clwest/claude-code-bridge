@@ -59,7 +59,7 @@ loosens these; there is no code path that grants more.
   `~/Donkey_Betz/`.
 - Edit and write files under `cwd`.
 - Task tracking (`TaskCreate`, `TaskUpdate`, `TaskGet`, `TaskList`,
-  `TodoWrite`) and the built-in web tools (`WebFetch`, `WebSearch`).
+  `TodoWrite`).
 - Git operations that don't publish: `add`, `commit`, `status`, `log`,
   `diff`, `show`, `branch`, `checkout`, `restore`, `rm`, `mv`, and
   `config --get`.
@@ -82,6 +82,8 @@ slips past the allowlist is still blocked:
 
 **Not passed to CC at all:**
 
+- `WebFetch`, `WebSearch` — deliberately absent; Cowork does web, and a
+  headless CC session gets no network beyond git (Chris, 2026-09-02).
 - `--dangerously-skip-permissions` / `--allow-dangerously-skip-permissions`.
   The whole point of this bridge is that the allowance is written down
   before the run; a flag that turns off permission checking wholesale
