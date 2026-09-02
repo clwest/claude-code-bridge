@@ -24,9 +24,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import re
+
 from .config import (
     ALLOWED_TOOLS,
     DISALLOWED_TOOLS,
+    MAX_BUDGET_CEILING_USD,
     MAX_BUDGET_USD,
     PERMISSION_MODE,
     RUNS_DIR,
@@ -95,7 +98,62 @@ def _resolve_under(path: Path, root: Path) -> Path:
     return resolved
 
 
-def _cc_command(session_id: str, resume: bool) -> list[str]:
+def _validate_budget(budget_usd: float | int | str | None) -> str:
+    """Return a `--max-budget-usd` string, or raise BridgeError.
+
+    Callers may pass a float, int, numeric string, or None (default).
+    Zero, negative, non-numeric and above-ceiling values are rejected
+    with a message that names the ceiling — do not silently clamp.
+    """
+    if budget_usd is None:
+        return MAX_BUDGET_USD
+    ceiling = float(MAX_BUDGET_CEILING_USD)
+    try:
+        value = float(budget_usd)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(
+            f"budget_usd must be a number (got {budget_usd!r}); "
+            f"ceiling is ${ceiling:.2f}"
+        ) from exc
+    if value != value or value <= 0:  # NaN or non-positive
+        raise BridgeError(
+            f"budget_usd must be greater than 0 (got {value}); "
+            f"ceiling is ${ceiling:.2f}"
+        )
+    if value > ceiling:
+        raise BridgeError(
+            f"budget_usd {value} exceeds ceiling ${ceiling:.2f}; "
+            "raise MAX_BUDGET_CEILING_USD in config.py deliberately"
+        )
+    return f"{value:.2f}"
+
+
+# The exact CLI message on 2.1.114 is `Error: Exceeded USD budget (2)`.
+# We match "exceeded" near "budget" case-insensitively so a different
+# number or minor rewording still fires. Do not try to parse the amount.
+_CAP_HIT_RE = re.compile(r"exceeded[^\n]{0,40}budget", re.IGNORECASE)
+
+
+def cap_hit(view: "JobView") -> bool:
+    """True iff the CLI wrote its budget-exceeded message to stdout or stderr.
+
+    Item 3 of TASK_bridge-followups-round-1: a cap-hit run and a botched
+    run need different responses (rerun with bigger cap vs. rebrief), so
+    the caller must be able to tell them apart without guessing.
+    """
+    for path in (view.stdout_path, view.stderr_path):
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if _CAP_HIT_RE.search(data.decode("utf-8", errors="replace")):
+            return True
+    return False
+
+
+def _cc_command(session_id: str, resume: bool, budget_usd: str) -> list[str]:
     """Build the claude CLI argv (no prompt — prompt goes on stdin).
 
     The prompt is sent via stdin rather than as a positional argument
@@ -115,7 +173,7 @@ def _cc_command(session_id: str, resume: bool) -> list[str]:
         "--permission-mode",
         PERMISSION_MODE,
         "--max-budget-usd",
-        MAX_BUDGET_USD,
+        budget_usd,
         "--allowedTools",
         " ".join(ALLOWED_TOOLS),
         "--disallowedTools",
@@ -304,10 +362,11 @@ def _spawn(cmd: list[str], cwd: Path, run_dir: Path, prompt: str, job_id: str) -
     return proc.pid
 
 
-def start_run(task_file: str, cwd: str) -> str:
+def start_run(task_file: str, cwd: str, budget_usd: float | int | str | None = None) -> str:
     """Start a fresh headless CC run. Returns job_id."""
     cwd_p = _validate_cwd(cwd)
     tf = _validate_task_file(task_file, cwd_p)
+    budget_str = _validate_budget(budget_usd)
 
     active = _active_in_cwd(cwd_p)
     if active:
@@ -323,8 +382,23 @@ def start_run(task_file: str, cwd: str) -> str:
 
     session_id = str(uuid.uuid4())
     task_rel = tf.relative_to(cwd_p)
-    prompt = f"Read {task_rel}"
-    cmd = _cc_command(session_id, resume=False)
+    # The prompt tells CC to DO the work, not consider it. Written this way
+    # because on 2026-09-02 a bare "Read <file>" prompt made a real headless
+    # run stop to ask whether it should proceed — with nobody on the other
+    # end of --print to answer. Do not "simplify" this back to `Read X`:
+    # a --print session that asks a question is a dead run that still costs
+    # money. `start_ask` passes the caller's prompt through unchanged (those
+    # come from Cowork and are already imperative).
+    prompt = (
+        f"Read {task_rel} and do the work in it now. This is a headless "
+        "session — there is no one to answer questions, so do not stop to "
+        "ask for confirmation. If you hit a decision you cannot make, "
+        "write the options, the costs and your recommendation into the "
+        "task file, then keep going with everything that is not blocked "
+        "by it. Finish by appending the dated report section and the "
+        "ask-list checklist and updating the frontmatter status."
+    )
+    cmd = _cc_command(session_id, resume=False, budget_usd=budget_str)
 
     pre_bytes = tf.read_bytes()
     (run_dir / "pre.txt").write_bytes(pre_bytes)
@@ -345,18 +419,30 @@ def start_run(task_file: str, cwd: str) -> str:
         "pid": pid,
         "task_file_size_before": len(pre_bytes),
         "task_file_sha256_before": _sha256(pre_bytes),
+        "budget_usd": budget_str,
     }
     _save_meta(run_dir / "meta.json", meta)
     return job_id
 
 
-def start_ask(prev_job_id: str, prompt: str) -> str:
+def start_ask(
+    prev_job_id: str,
+    prompt: str,
+    budget_usd: float | int | str | None = None,
+) -> str:
     """Resume an existing CC session with a follow-up prompt. Returns new job_id."""
     _, prev_meta = _load_meta(prev_job_id)
     cwd_p = Path(prev_meta["cwd"])
     session_id = prev_meta["session_id"]
     task_file = Path(prev_meta["task_file"])
     task_rel = prev_meta.get("task_file_rel", str(task_file))
+    # cc_ask with no budget inherits the prior job's cap, falling back
+    # to the default for jobs recorded before budget_usd was stored.
+    if budget_usd is None:
+        inherited = prev_meta.get("budget_usd")
+        budget_str = _validate_budget(inherited) if inherited is not None else MAX_BUDGET_USD
+    else:
+        budget_str = _validate_budget(budget_usd)
 
     if not cwd_p.is_dir():
         raise BridgeError(f"prior cwd no longer exists: {cwd_p}")
@@ -375,7 +461,7 @@ def start_ask(prev_job_id: str, prompt: str) -> str:
     run_dir = RUNS_DIR / job_id
     run_dir.mkdir()
 
-    cmd = _cc_command(session_id, resume=True)
+    cmd = _cc_command(session_id, resume=True, budget_usd=budget_str)
 
     # Cache the task file contents so a follow-up ask's contract check
     # measures what THIS ask added.
@@ -399,6 +485,7 @@ def start_ask(prev_job_id: str, prompt: str) -> str:
         "pid": pid,
         "task_file_size_before": len(pre_bytes),
         "task_file_sha256_before": _sha256(pre_bytes),
+        "budget_usd": budget_str,
     }
     _save_meta(run_dir / "meta.json", meta)
     return job_id

@@ -30,6 +30,7 @@ from . import __version__
 from .contract import check as contract_check
 from .runner import (
     BridgeError,
+    cap_hit,
     elapsed,
     is_running,
     list_jobs,
@@ -37,6 +38,11 @@ from .runner import (
     start_ask,
     start_run,
     tail,
+)
+
+
+_CAP_LINE = (
+    "BUDGET: CAP HIT \u2014 output is truncated, the work is probably incomplete"
 )
 
 
@@ -76,18 +82,21 @@ def _format_job_line(view) -> str:
 @server.tool(
     name="cc_run",
     description=(
-        "Start a headless Claude Code session in `cwd` with the prompt "
-        "`Read <task_file>`. `task_file` must be an existing TASK_*.md "
-        "under `cwd`, and `cwd` must be under ~/Donkey_Betz/. Refuses if "
-        "another job is already running in that cwd. Returns a job_id "
-        "immediately; the CC session runs in the background."
+        "Start a headless Claude Code session in `cwd` on a TASK_*.md file, "
+        "telling it to do the work now (not to ask for confirmation). "
+        "`task_file` must be an existing TASK_*.md under `cwd`, and `cwd` "
+        "must be under ~/Donkey_Betz/. Refuses if another job is already "
+        "running in that cwd. Optional `budget_usd` overrides the default "
+        "$2.00 per-run cap, up to a ceiling of $20.00; this is Claude "
+        "Code's own cost-estimate cap on a subscription, not a bill. "
+        "Returns a job_id immediately; the CC session runs in the background."
     ),
     structured_output=False,  # see module docstring
 )
-def cc_run(task_file: str, cwd: str) -> str:
+def cc_run(task_file: str, cwd: str, budget_usd: float | None = None) -> str:
     """Start a headless CC run on a task file."""
     try:
-        job_id = start_run(task_file, cwd)
+        job_id = start_run(task_file, cwd, budget_usd=budget_usd)
         return f"Started job {job_id}"
     except Exception as exc:
         return _friendly_error(exc)
@@ -119,9 +128,12 @@ def cc_status(job_id: str) -> str:
             f"session_id: {m['session_id']}",
             f"task_file: {m['task_file']}",
             f"kind: {m.get('kind', 'run')}",
+            f"budget: ${m.get('budget_usd', '2.00')}",
         ]
         if m.get("ended_at"):
             parts.append(f"ended_at: {m['ended_at']}")
+        if cap_hit(view):
+            parts.append(_CAP_LINE)
         stdout_tail = tail(view.stdout_path)
         stderr_tail = tail(view.stderr_path)
         if stdout_tail:
@@ -157,11 +169,14 @@ def cc_result(job_id: str) -> str:
         result = contract_check(task_file, pre_text)
         stdout_text = view.stdout_path.read_text(errors="replace") if view.stdout_path.is_file() else ""
         stderr_text = view.stderr_path.read_text(errors="replace") if view.stderr_path.is_file() else ""
+        cap = cap_hit(view)
         header = (
             f"--- CONTRACT CHECK ({view.meta['task_file_rel']}) ---\n"
+            + (f"{_CAP_LINE}\n" if cap else "")
             + result.render()
             + f"session_id: {view.meta['session_id']}\n"
-            + f"exit_code: {view.meta.get('exit_code', 'unknown')}\n"
+            + f"exit_code: {view.meta.get('exit_code', 'unknown')}  "
+            + f"budget: ${view.meta.get('budget_usd', '2.00')}\n"
             + f"cwd: {view.meta['cwd']}\n"
             + f"elapsed: {elapsed(view):.1f}s\n"
         )
@@ -178,15 +193,17 @@ def cc_result(job_id: str) -> str:
     description=(
         "Send a follow-up prompt into the SAME CC session as a prior "
         "job (resumed by session_id). Use this to say 'you skipped the "
-        "ask list, please add it' or 'clarify X'. Returns a new job_id "
-        "for the follow-up run."
+        "ask list, please add it' or 'clarify X'. Optional `budget_usd` "
+        "overrides the inherited budget from the prior job (defaults to "
+        "$2.00, ceiling $20.00; Claude Code cost-estimate cap, not a "
+        "bill). Returns a new job_id for the follow-up run."
     ),
     structured_output=False,
 )
-def cc_ask(job_id: str, prompt: str) -> str:
+def cc_ask(job_id: str, prompt: str, budget_usd: float | None = None) -> str:
     """Ask a follow-up in the same session."""
     try:
-        new_job_id = start_ask(job_id, prompt)
+        new_job_id = start_ask(job_id, prompt, budget_usd=budget_usd)
         return f"Started follow-up job {new_job_id}"
     except Exception as exc:
         return _friendly_error(exc)

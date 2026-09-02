@@ -16,9 +16,18 @@ WORKSPACE_ROOT = Path.home() / "Donkey_Betz"
 # is the report Cowork or Chris reads in the task file itself.
 RUNS_DIR = WORKSPACE_ROOT / "playground" / "cc-runs"
 
-# Cost cap per invocation, in USD. --max-turns does not exist on the
-# claude CLI (2.1.114); --max-budget-usd does, and stops the run when hit.
+# Default cost cap per invocation, in USD. --max-turns does not exist on
+# the claude CLI (2.1.114); --max-budget-usd does, and stops the run
+# when hit. A caller may override this per-run via cc_run/cc_ask, up to
+# MAX_BUDGET_CEILING_USD below.
 MAX_BUDGET_USD = "2.00"
+
+# The most the bridge will ever pass to --max-budget-usd, regardless of
+# what a caller asks for. A bad or too-large value is rejected, not
+# clamped — see runner._validate_budget. Raise this only after a
+# deliberate conversation about blast radius; a runaway CC session that
+# is allowed to spend more can also make more of a mess.
+MAX_BUDGET_CEILING_USD = "20.00"
 
 # --permission-mode default: in --print mode, an unresolvable permission
 # prompt fails cleanly rather than hanging. Combined with the allow/deny

@@ -1,0 +1,220 @@
+---
+title: "TASK — bridge follow-ups round 1: don't-ask prompt, budget as an argument, cap visibility, root tidy"
+date: 2026-09-02
+for: Claude Code (headless, via the bridge itself)
+status: not started
+protocol: ../../../../CLAUDE.md
+---
+
+# Why this exists
+
+The `claude-code-bridge` MCP server went live on 2026-09-02 and was used for
+real work five times the same day. Three problems showed up in those five runs.
+They are all in this file. Nothing here is speculative — each one has a log
+line or a run behind it.
+
+You are editing the server that is running you. That is fine. The running MCP
+server keeps the old code in memory until the desktop app is restarted, so
+nothing you change takes effect mid-run and nothing can break the session you
+are in. **Do not try to restart anything.** Restarting the desktop app is
+Chris's step, and he will do it after you commit.
+
+---
+
+## Item 1 — the prompt has to tell CC to do the work, not consider it
+
+**Symptom.** On one of the first real runs the headless session read the task
+file, replied asking whether it should proceed, and exited. Nothing was built.
+There is no one on the other end of a `--print` session to answer, so an
+answer-shaped reply is a dead run that still costs money.
+
+**Cause.** `runner.start_run` builds the whole prompt as:
+
+```python
+prompt = f"Read {task_rel}"
+```
+
+That is an instruction to read. It is not an instruction to work.
+
+**What to do.** In `src/claude_code_bridge/runner.py`, `start_run`, make the
+prompt say what the run is for. Something with this content, wording is yours:
+
+> Read `<task_rel>` and do the work in it now. This is a headless session —
+> there is no one to answer questions, so do not stop to ask for
+> confirmation. If you hit a decision you cannot make, write the options, the
+> costs and your recommendation into the task file, then keep going with
+> everything that is not blocked by it. Finish by appending the dated report
+> section and the ask-list checklist and updating the frontmatter status.
+
+Keep it one paragraph. Put the sentence about *why* the prompt is written this
+way in a comment above it, the way the rest of this file explains its
+decisions, so the next reader does not "simplify" it back to `Read X`.
+
+`start_ask` passes the caller's prompt through unchanged — leave that alone.
+The caller (Cowork) writes those, and they are already imperative.
+
+---
+
+## Item 2 — budget has to be an argument, not a constant
+
+**Symptom.** The workspace-tidy task hit the cap twice and had to be finished
+in three separate runs. Verbatim, from
+`playground/cc-runs/20260902T220501Z-61e4aa0a/stdout.log`:
+
+```
+Error: Exceeded USD budget (2)
+```
+
+The first run stopped with 46 renames staged and nothing committed. Recovering
+cost two more runs and a hand-written state dump in the follow-up prompt.
+
+**Cause.** `config.MAX_BUDGET_USD = "2.00"` is a module constant, passed on
+every spawn by `_cc_command`. A big task and a five-line task get the same cap,
+and the only way to change it is to edit the file and restart the app.
+
+**What to do.**
+
+1. In `config.py`, keep `MAX_BUDGET_USD = "2.00"` as the **default** and add
+   `MAX_BUDGET_CEILING_USD = "20.00"` next to it, with a comment saying it is
+   the most the bridge will ever pass no matter what a caller asks for.
+2. `_cc_command` takes the budget as a parameter instead of reading the
+   constant.
+3. `start_run(task_file, cwd, budget_usd=None)` and
+   `start_ask(prev_job_id, prompt, budget_usd=None)` accept an optional budget.
+   Validate it: must parse as a float, must be greater than 0, must be less
+   than or equal to the ceiling. A bad value raises `BridgeError` with a
+   message that names the ceiling — do not silently clamp it.
+4. `start_ask` with no budget inherits the prior job's budget from its
+   `meta.json`, falling back to the default if the key is absent (jobs from
+   before this change have no such key — handle that).
+5. Record the resolved budget in `meta.json` as `budget_usd`.
+6. `cc_run` and `cc_ask` in `server.py` grow an optional `budget_usd: float |
+   None = None` parameter, and their tool descriptions say: default $2.00,
+   ceiling $20.00, and that this is Claude Code's own cost-estimate cap on a
+   subscription, not a bill. Keep `structured_output=False` on every tool — the
+   module docstring explains why, and that has not changed.
+
+---
+
+## Item 3 — a run that hit the cap must say so at the top
+
+**Symptom.** When the cap is hit, the failure is one line buried in stdout, and
+`cc_result` still prints `REPORT: MISSING` as if CC had simply not done the
+work. The reviewer has to guess whether the task was botched or just cut off.
+Those need different responses: one is a re-brief, the other is a re-run with a
+bigger number.
+
+**What to do.** Add cap detection to the runner (a small helper, not inline
+regex in two places). It reads the job's `stdout.log` and `stderr.log` and
+looks for the CLI's own message. The exact text as observed on 2.1.114 is:
+
+```
+Error: Exceeded USD budget (2)
+```
+
+Match it loosely enough to survive a different number and minor rewording —
+case-insensitive `exceeded` near `budget` is enough — and do not try to be
+clever about parsing the amount out of it.
+
+Then:
+
+- `cc_status` prints a `budget: $X.XX` line, and when the cap was hit, a line
+  that cannot be missed: `BUDGET: CAP HIT — output is truncated, the work is
+  probably incomplete`.
+- `cc_result` prints the same cap line **inside the CONTRACT CHECK block**,
+  above `REPORT:`, and `budget: $X.XX` alongside `exit_code:`.
+
+Leave `contract.py` alone. The contract check is about what is in the task
+file; this is about what happened to the process. Keep them separate.
+
+---
+
+## Item 4 — the loose task file at this repo's root
+
+`TASK_cut-web-tools.md` sits at the root of this repo. Chris's rule, set
+2026-09-02 after he opened `~/Donkey_Betz` and found 55 loose markdown files:
+briefs live in `docs/tasks/`, and a repo root keeps only `CLAUDE.md`,
+`00-START-NEXT-SESSION.md` and a `README.md`.
+
+Move it with `git mv` to `docs/tasks/TASK_cut-web-tools.md`. Grep the repo for
+anything that names it by path and fix those references. Do not edit its
+contents — its report section is the record of that run.
+
+---
+
+## Item 5 — tests and README
+
+**Tests.** `tests/` currently holds one file, the zombie-liveness regression.
+Add a second file for this round. It must not need the `claude` CLI, the same
+way the existing one does not. Cover at least:
+
+- a budget above the ceiling raises `BridgeError`, and the message names the
+  ceiling
+- a zero, negative or non-numeric budget raises `BridgeError`
+- a valid budget lands in the built argv after `--max-budget-usd`
+- no budget given → the default `2.00` is what gets passed
+- `start_ask` inherits the prior job's budget, and tolerates a `meta.json`
+  with no `budget_usd` key
+- the cap detector fires on the verbatim line in Item 3 and does not fire on
+  ordinary output that merely contains the word "budget"
+
+Run `pytest` and put the real counts in the report.
+
+**README.** Three places go stale with this change and all three are load
+bearing, because the README is what Chris reads before saying yes to what the
+server may do unattended:
+
+- the tool table's `cc_run` and `cc_ask` rows (new argument)
+- the "What this server can do to this machine unattended" section, which
+  currently states a flat **$2.00** cap — it now says: default $2.00, caller
+  may raise it up to a $20.00 ceiling, and the bridge will never pass more
+  than the ceiling
+- the contract-check section, which should mention the cap line
+
+---
+
+## Non-goals
+
+- **Do not touch `ALLOWED_TOOLS` or `DISALLOWED_TOOLS`.** Not to make a test
+  pass, not to make your own life easier during this run. The allowance is
+  written down before the run and that is the entire point of the server.
+- **Do not add a sixth tool.** Five is the surface.
+- **Do not change `PERMISSION_MODE`,** and do not reach for
+  `--dangerously-skip-permissions` for any reason.
+- **Do not rewrite `contract.py`.** Item 3 is deliberately outside it.
+- **Do not push.** The bridge denies `git push` anyway. Commit only.
+- **Do not restart the desktop app or the MCP server,** and do not tell Chris
+  the new behaviour is live — it is not, until he restarts.
+- **Do not delete anything.** `rm` is denied. If something needs to go, say so
+  in the report and leave it.
+- **Do not go tidying the rest of the repo.** Item 4 is the one move.
+
+## Budget note for this run
+
+You are running on the current $2.00 cap — the fix for that is Item 2, which
+is not in effect yet. Work in this order: Item 1, Item 2, Item 3, Item 4,
+tests, README. If you get close to the cap, **commit what is finished** and say
+plainly in the report which items are done and which are not. A truthful
+partial report is worth more than a run that dies mid-edit.
+
+## Done means
+
+- [ ] `runner.start_run` builds a prompt that tells CC to do the work and not
+      to stop for confirmation, with a comment saying why
+- [ ] `config.py` has both a default and a ceiling, each commented
+- [ ] `start_run` and `start_ask` take an optional `budget_usd`, validate it
+      against the ceiling, and raise `BridgeError` on a bad value
+- [ ] `start_ask` inherits the prior job's budget when none is given
+- [ ] the resolved budget is written to `meta.json` as `budget_usd`
+- [ ] `cc_run` and `cc_ask` expose `budget_usd`, descriptions updated, all
+      five tools still `structured_output=False`
+- [ ] `cc_status` and `cc_result` both show the budget, and both show an
+      unmissable cap line when the cap was hit
+- [ ] `TASK_cut-web-tools.md` is at `docs/tasks/` via `git mv`, contents
+      unchanged, references updated
+- [ ] `pytest` passes; the report gives the real number of tests
+- [ ] README updated in the three places named in Item 5
+- [ ] one commit, not pushed
+- [ ] a dated `## Report — 2026-09-02` section appended to THIS file, with a
+      checklist marking every box above done / not done / not possible, and
+      the frontmatter `status:` updated
