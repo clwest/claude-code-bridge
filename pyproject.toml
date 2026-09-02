@@ -1,0 +1,27 @@
+[project]
+name = "claude-code-bridge"
+version = "0.1.0"
+description = "MCP server that drives a headless Claude Code session on a TASK_*.md file, with a contract-check on the report."
+requires-python = ">=3.11"
+readme = "README.md"
+
+# mcp>=2,<3
+#   FastMCP was removed at 2.0. This server targets the 2.x MCPServer API.
+#   Do not pin below 2 to "make examples work" — those examples are stale.
+#
+# Zero third-party dependencies beyond the MCP SDK: the bridge shells out to
+# the `claude` CLI that Chris is already logged into. Nothing else to install.
+dependencies = [
+    "mcp>=2,<3",
+]
+
+[project.scripts]
+claude-code-bridge = "claude_code_bridge.__main__:main"
+claude-code-bridge-cli = "claude_code_bridge.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_code_bridge"]

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin wrapper so users don't have to activate the venv or type long paths.
+# Calls the CLI harness with whatever args you give it.
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$DIR/.venv/bin/python" -m claude_code_bridge.cli "$@"
