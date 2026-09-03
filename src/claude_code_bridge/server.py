@@ -105,9 +105,11 @@ def cc_run(task_file: str, cwd: str, budget_usd: float | None = None) -> str:
 @server.tool(
     name="cc_status",
     description=(
-        "Report on a job started with cc_run or cc_ask: running/finished, "
-        "elapsed seconds, exit code if finished, and the last ~20 lines "
-        "of stdout+stderr. Does not block."
+        "Report on a job started with cc_run or cc_ask: running/finished "
+        "(or 'finished (exit unknown)' if the wrapper died before writing "
+        "the exit code), elapsed seconds, budget, and the last ~20 lines "
+        "of stdout+stderr. Does not block. The numeric exit code is on "
+        "cc_result, not here."
     ),
     structured_output=False,
 )

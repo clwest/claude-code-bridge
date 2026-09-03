@@ -6,6 +6,7 @@ State per job lives on disk under `RUNS_DIR/<job_id>/`:
     pre.txt       — task file contents before the run (for the contract check)
     stdout.log    — stdout captured verbatim
     stderr.log    — stderr captured verbatim
+    exit_code     — written by the bash wrapper after CC exits (see `_spawn`)
 
 The record on disk is the source of truth. The MCP server process may be
 restarted between `cc_run` and `cc_status`; the state is read from disk on
