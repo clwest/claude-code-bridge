@@ -281,3 +281,37 @@ green 22.
 One commit on `main` in `claude-code-bridge`, not pushed. Not a real risk:
 the change lives in a git repo with a remote and is one push away from
 backup; nothing in this session is the only copy of anything. Chris pushes.
+
+---
+
+## Verification — 2026-09-03 (Cowork, live through the MCP tools)
+
+The recovery point was exercised end to end, not just in the unit tests.
+Evidence, verified by Cowork through the MCP tools against this repo:
+
+- Job `20260903T004943Z-d80792d6` ran with `README.md` deliberately
+  modified (a tracked file) and `docs/tasks/TASK_recovery-smoke.md`
+  present as an untracked file — a real dirty tree with both flavours.
+- `cc_result` printed the three-line recovery block: `pre-run HEAD:
+  1c4901e (main), tree dirty`; `pre-run snapshot:
+  refs/cc-bridge/20260903T004943Z-d80792d6`; and both the
+  `git diff 1c4901e..HEAD` and `git stash apply refs/cc-bridge/...`
+  recovery commands.
+- That ref exists and points at commit
+  `ad749b58dceea73decf532a738301c00cf6a3c71`. `git show <ref>:README.md`
+  contains the test marker, so the snapshot really captured the
+  uncommitted change to a tracked file, not a stale HEAD.
+- `pre_git_status.txt` in the run directory holds both status lines,
+  including `?? docs/tasks/TASK_recovery-smoke.md`. This is the point of
+  capturing porcelain: `git stash create` does not take untracked files
+  (README already states this), and the status file is what tells the
+  reviewer that path existed pre-run so a missing one is visible.
+
+**On garbage-collection survival.** The `git gc --prune=now` survival
+claim is covered by the unit test
+`test_snapshot_survives_git_gc_prune_now`, **not** by this live run.
+Cowork's live `git gc` attempt ran from the Cowork bridge shell and died
+with `failed to run reflog` because that shell reaches this folder over a
+mount that cannot unlink. So: the live run verifies the snapshot is
+written and readable; the unit test verifies it survives gc. Both are
+needed and neither is the other.
