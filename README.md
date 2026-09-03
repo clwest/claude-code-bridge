@@ -51,6 +51,61 @@ The bridge does **not** fix any of these. It makes them impossible to
 miss. Cowork then uses `cc_ask` to send it back — which is exactly what
 Chris did by hand on 2026-07-22 and what Cowork did by hand on 2026-09-02.
 
+## Recovering from a run
+
+The deny list is not a boundary (see the containment note below); the
+containment that actually holds is the cwd bound, the one-run-per-cwd
+lock and the budget cap. That leaves the question a deny list was never
+going to answer: **when a run damages something inside the cwd it was
+legitimately given, how do we get it back?** This section is the answer.
+
+Before every `cc_run` and `cc_ask`, the bridge captures a recovery point
+from the run's `cwd` and records it in the job's `meta.json` under
+`pre_run_git`:
+
+- `head_sha`, `branch`, `dirty` — the commit the run started from.
+- `snapshot_ref` — on a dirty tree, `git stash create` produces a commit
+  object capturing the working tree without touching the working tree,
+  the index or the stash list. The bridge immediately anchors that
+  object under `refs/cc-bridge/<job_id>` with `git update-ref`, so a
+  later `git gc` cannot delete it. On a clean tree there is nothing to
+  snapshot and `snapshot_ref` is `null`.
+- `pre_git_status.txt` — verbatim `git status --porcelain`, written into
+  the run directory next to `pre.txt`.
+
+`cc_result` prints the recovery point above the CC output, at most three
+lines, e.g.:
+
+```
+pre-run HEAD: 380e98b (main), tree dirty
+pre-run snapshot: refs/cc-bridge/20260903T001809Z-69a69826
+recover with: git diff 380e98b..HEAD    |    git stash apply refs/cc-bridge/20260903T001809Z-69a69826
+```
+
+On a clean tree it prints `tree clean — no snapshot needed` and only the
+diff command. If git is unavailable or the cwd is not a git repository,
+it prints one line saying so and no commands. `cc_status` prints a
+one-line `pre-run HEAD: <short sha> (<branch>)` — status is for "is it
+done yet", not recovery.
+
+**Real limitation, stated plainly:** `git stash create` does **not**
+capture untracked files. A file CC has never seen committed is not in
+the snapshot. `pre_git_status.txt` at least tells the reviewer which
+untracked paths existed before the run, so a missing one is visible
+rather than silent. Stashing untracked files was considered and rejected
+because it would change the working tree, and a transport layer must not
+do that to a repo it was only asked to run a session in.
+
+Snapshot refs accumulate under `refs/cc-bridge/`. List them with:
+
+```
+git for-each-ref refs/cc-bridge/
+```
+
+and delete stale ones by hand (`git update-ref -d refs/cc-bridge/<job_id>`).
+The bridge does not delete them, because a transport layer that prunes
+its own recovery points is not a recovery mechanism.
+
 ## What this server can do to this machine unattended
 
 Written before the first non-test run, and it is the thing to say yes to

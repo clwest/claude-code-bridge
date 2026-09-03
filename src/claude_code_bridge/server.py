@@ -46,6 +46,64 @@ _CAP_LINE = (
 )
 
 
+def _short(sha: str | None) -> str:
+    return sha[:7] if sha else "?"
+
+
+def _recovery_block(pre_run_git: dict | None) -> str:
+    """Render the recovery point for cc_result. At most three lines.
+
+    Sits above the CC output; must not push the actual result off the
+    screen. Non-repo / missing snapshot cases collapse to one line.
+    """
+    if not pre_run_git:
+        return "pre-run git: not captured"
+    if "git" in pre_run_git:
+        # Non-repo, git-not-on-path, timeout — one line, no commands.
+        return f"pre-run git: {pre_run_git['git']}"
+
+    head = pre_run_git.get("head_sha")
+    branch = pre_run_git.get("branch") or "?"
+    dirty = pre_run_git.get("dirty")
+    snap = pre_run_git.get("snapshot_ref")
+
+    if not head:
+        return "pre-run git: HEAD unavailable"
+
+    short = _short(head)
+    if dirty and snap:
+        return (
+            f"pre-run HEAD: {short} ({branch}), tree dirty\n"
+            f"pre-run snapshot: {snap}\n"
+            f"recover with: git diff {short}..HEAD    |    "
+            f"git stash apply {snap}"
+        )
+    if dirty and not snap:
+        # Dirty but the snapshot step failed — say so, still give the diff.
+        return (
+            f"pre-run HEAD: {short} ({branch}), tree dirty (snapshot failed)\n"
+            f"recover with: git diff {short}..HEAD"
+        )
+    # Clean tree.
+    return (
+        f"pre-run HEAD: {short} ({branch}), tree clean \u2014 no snapshot needed\n"
+        f"recover with: git diff {short}..HEAD"
+    )
+
+
+def _status_pre_run_line(pre_run_git: dict | None) -> str | None:
+    """One-line pre-run HEAD summary for cc_status. No recovery commands."""
+    if not pre_run_git:
+        return None
+    if "git" in pre_run_git:
+        return f"pre-run git: {pre_run_git['git']}"
+    head = pre_run_git.get("head_sha")
+    branch = pre_run_git.get("branch") or "?"
+    if not head:
+        return "pre-run HEAD: unavailable"
+    return f"pre-run HEAD: {_short(head)} ({branch})"
+
+
 server: MCPServer = MCPServer(
     name="claude-code-bridge",
     version=__version__,
@@ -134,6 +192,9 @@ def cc_status(job_id: str) -> str:
         ]
         if m.get("ended_at"):
             parts.append(f"ended_at: {m['ended_at']}")
+        pre_line = _status_pre_run_line(m.get("pre_run_git"))
+        if pre_line:
+            parts.append(pre_line)
         if cap_hit(view):
             parts.append(_CAP_LINE)
         stdout_tail = tail(view.stdout_path)
@@ -181,6 +242,7 @@ def cc_result(job_id: str) -> str:
             + f"budget: ${view.meta.get('budget_usd', '2.00')}\n"
             + f"cwd: {view.meta['cwd']}\n"
             + f"elapsed: {elapsed(view):.1f}s\n"
+            + _recovery_block(view.meta.get("pre_run_git")) + "\n"
         )
         body = "\n--- CC OUTPUT ---\n" + (stdout_text or "(empty)")
         if stderr_text.strip():

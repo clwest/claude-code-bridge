@@ -154,6 +154,105 @@ def cap_hit(view: "JobView") -> bool:
     return False
 
 
+# Every git subprocess in the recovery-point helper runs with this timeout.
+# 5 seconds is plenty for local git; anything longer is a hung or
+# network-backed repo and we would rather skip the snapshot than block a
+# spawn. The helper never lets a git failure fail the run.
+_GIT_TIMEOUT_S = 5.0
+
+
+def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run a git subprocess with an explicit cwd and a short timeout.
+
+    Kept in one place so the timeout, cwd and text-mode decisions are the
+    same everywhere. Callers handle CalledProcessError / TimeoutExpired /
+    FileNotFoundError — nothing here raises out of the caller's try/except.
+    """
+    return subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT_S,
+        check=True,
+    )
+
+
+def _pre_run_git_snapshot(cwd: Path, job_id: str, run_dir: Path) -> dict:
+    """Capture the state of `cwd` before the run and anchor a snapshot.
+
+    Returns a dict suitable for `meta.json["pre_run_git"]`. Never raises:
+    a cwd that is not a git repository, a hung git, a permission error —
+    all record what happened and return, because refusing to spawn on a
+    missing recovery point would be worse than not having one. See
+    TASK_pre-run-recovery-point.md for the full rationale.
+
+    Writes the verbatim `git status --porcelain` to `pre_git_status.txt`
+    in the run directory when git is available (it can be long, so it does
+    not go into meta.json).
+
+    On a dirty tree, calls `git stash create` (which writes a commit object
+    without touching the working tree, index or stash list) and immediately
+    anchors it under `refs/cc-bridge/<job_id>` with `git update-ref`, so a
+    later `git gc` cannot collect it. `git stash create` does NOT capture
+    untracked files — this is a real limitation and is stated in the README
+    alongside the recovery commands. `status_porcelain` at least records
+    which untracked paths existed pre-run.
+    """
+    # First, is this a git repo at all? A non-repo cwd is a normal case,
+    # not an error. `rev-parse --is-inside-work-tree` is the cheapest probe.
+    try:
+        _git(["rev-parse", "--is-inside-work-tree"], cwd)
+    except FileNotFoundError:
+        return {"git": "git not on PATH"}
+    except subprocess.TimeoutExpired:
+        return {"git": "git timed out"}
+    except subprocess.CalledProcessError:
+        return {"git": "not a repository"}
+
+    info: dict = {
+        "head_sha": None,
+        "branch": None,
+        "dirty": False,
+        "snapshot_ref": None,
+    }
+
+    try:
+        info["head_sha"] = _git(["rev-parse", "HEAD"], cwd).stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        # Empty repo, detached weirdness, or hung git — record and press on.
+        info["head_sha"] = None
+
+    try:
+        info["branch"] = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd).stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        info["branch"] = None
+
+    try:
+        status = _git(["status", "--porcelain"], cwd).stdout
+        (run_dir / "pre_git_status.txt").write_text(status)
+        info["dirty"] = bool(status.strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        # If we cannot even ask for status, treat the tree as clean —
+        # attempting a snapshot on an unknown-state repo is worse than not.
+        info["dirty"] = False
+
+    if info["dirty"]:
+        try:
+            sha = _git(["stash", "create"], cwd).stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            sha = ""
+        if sha:
+            ref = f"refs/cc-bridge/{job_id}"
+            try:
+                _git(["update-ref", ref, sha], cwd)
+                info["snapshot_ref"] = ref
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                info["snapshot_ref"] = None
+
+    return info
+
+
 def _cc_command(session_id: str, resume: bool, budget_usd: str) -> list[str]:
     """Build the claude CLI argv (no prompt — prompt goes on stdin).
 
@@ -404,6 +503,8 @@ def start_run(task_file: str, cwd: str, budget_usd: float | int | str | None = N
     pre_bytes = tf.read_bytes()
     (run_dir / "pre.txt").write_bytes(pre_bytes)
 
+    pre_run_git = _pre_run_git_snapshot(cwd_p, job_id, run_dir)
+
     pid = _spawn(cmd, cwd_p, run_dir, prompt, job_id)
 
     meta = {
@@ -421,6 +522,7 @@ def start_run(task_file: str, cwd: str, budget_usd: float | int | str | None = N
         "task_file_size_before": len(pre_bytes),
         "task_file_sha256_before": _sha256(pre_bytes),
         "budget_usd": budget_str,
+        "pre_run_git": pre_run_git,
     }
     _save_meta(run_dir / "meta.json", meta)
     return job_id
@@ -469,6 +571,8 @@ def start_ask(
     pre_bytes = task_file.read_bytes() if task_file.is_file() else b""
     (run_dir / "pre.txt").write_bytes(pre_bytes)
 
+    pre_run_git = _pre_run_git_snapshot(cwd_p, job_id, run_dir)
+
     pid = _spawn(cmd, cwd_p, run_dir, prompt, job_id)
 
     meta = {
@@ -487,6 +591,7 @@ def start_ask(
         "task_file_size_before": len(pre_bytes),
         "task_file_sha256_before": _sha256(pre_bytes),
         "budget_usd": budget_str,
+        "pre_run_git": pre_run_git,
     }
     _save_meta(run_dir / "meta.json", meta)
     return job_id
