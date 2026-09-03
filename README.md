@@ -17,10 +17,10 @@ Five tools. That's the whole surface.
 
 | Tool | What it does |
 |---|---|
-| `cc_run(task_file, cwd)` | Start a headless CC session in `cwd` with the prompt `Read <task_file>`. Refuses non-`TASK_*.md` inputs, refuses cwds outside `~/Donkey_Betz/`, refuses if another job is already running in that cwd. Returns a `job_id`. |
-| `cc_status(job_id)` | running / finished, elapsed seconds, and the last few lines of stdout+stderr. |
+| `cc_run(task_file, cwd, budget_usd=None)` | Start a headless CC session in `cwd`, telling it to do the work in `task_file` now (not to ask for confirmation). Refuses non-`TASK_*.md` inputs, refuses cwds outside `~/Donkey_Betz/`, refuses if another job is already running in that cwd. Optional `budget_usd` overrides the default $2.00 per-run cap, up to a ceiling of $20.00. Returns a `job_id`. |
+| `cc_status(job_id)` | running / finished, elapsed seconds, budget, and the last few lines of stdout+stderr. If the budget cap was hit, a `BUDGET: CAP HIT` line makes that unmissable. |
 | `cc_result(job_id)` | The full final output once finished, plus a **CONTRACT CHECK** (see below). Errors if the job is still running. |
-| `cc_ask(job_id, prompt)` | A follow-up question **into the same CC session** (resumed by `session_id`). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
+| `cc_ask(job_id, prompt, budget_usd=None)` | A follow-up question **into the same CC session** (resumed by `session_id`). Optional `budget_usd` overrides the inherited budget from the prior job (default $2.00, ceiling $20.00). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
 | `cc_list()` | Every job this bridge has started, with cwd and current state. |
 
 ## The contract check
@@ -37,6 +37,13 @@ top of the result:
   "not started" header is visible immediately.
 - `BYTES ADDED THIS RUN` — a rough sanity check on how much the file
   grew.
+- `BUDGET: CAP HIT — output is truncated, the work is probably incomplete`
+  — printed above the report line when the CLI wrote its budget-exceeded
+  message. This is deliberately separate from the report-contract lines
+  above: a cap-hit run and a botched run need different responses (rerun
+  with a bigger `budget_usd`, versus rebrief the task), so the reviewer
+  must be able to tell them apart without guessing. `cc_status` prints
+  the same line when the cap was hit.
 
 The bridge does **not** fix any of these. It makes them impossible to
 miss. Cowork then uses `cc_ask` to send it back — which is exactly what
@@ -49,9 +56,14 @@ before Chris restarts the desktop app.
 
 The bridge starts `claude --print …` subprocesses. Each subprocess is a
 full Claude Code session with the tool allow/deny lists below, pinned by
-this server on every spawn. Every run has a per-session budget cap of
-**$2.00** USD (`--max-budget-usd`). The bridge itself never elevates or
-loosens these; there is no code path that grants more.
+this server on every spawn. Every run has a per-session budget cap
+(`--max-budget-usd`): the default is **$2.00** USD, and a caller may
+raise it per-run up to a hard ceiling of **$20.00** — the bridge will
+never pass more than the ceiling, and rejects out-of-range values rather
+than silently clamping them. Raising the ceiling itself is a
+deliberate edit to `config.py`, not something a caller can do at
+runtime. The bridge itself never elevates or loosens the tool
+permissions; there is no code path that grants more.
 
 **Allowed, without asking:**
 
@@ -79,6 +91,23 @@ slips past the allowlist is still blocked:
   `yarn install`.
 - `curl`, `wget`, `ssh`, `scp`, `rsync` — no raw network fetches.
 - `defaults`, `security` — no macOS preferences or keychain access.
+
+**Known limitation — the shell deny list is a speed bump, not a boundary.**
+`python3` (and `python`) are on the *allow* list because tests, scripts
+and formatters need them. Anything a denied shell command could do, a CC
+session can still do by calling it through Python — `import os;
+os.unlink(path)` reaches the same syscall as `rm`, `urllib.request`
+reaches the same one as `curl`. This was hit in practice on 2026-09-02
+while cleaning up a stale `.git/index.lock`: `Bash(rm:*)` refused,
+`Bash(find … -delete)` refused, `python3 -c "import os;
+os.unlink(...)"` went through. So read the deny list as *makes the wrong
+thing awkward to do by accident*, not *makes it impossible to do on
+purpose*. Real containment is the cwd bound (`~/Donkey_Betz/`), the
+one-run-per-cwd lock, the missing `WebFetch`/`WebSearch`, and the
+budget cap — not the shell denies. Locking this down further (a
+minimal-python allowlist, or dropping Python from the allow list and
+routing tests through `pytest`/`ruff` entries only) is a decision for
+Chris, not for the bridge.
 
 **Not passed to CC at all:**
 

@@ -2,7 +2,7 @@
 title: "TASK — bridge follow-ups round 1: don't-ask prompt, budget as an argument, cap visibility, root tidy"
 date: 2026-09-02
 for: Claude Code (headless, via the bridge itself)
-status: blocked
+status: done
 protocol: ../../../../CLAUDE.md
 ---
 
@@ -298,4 +298,106 @@ lands after `--max-budget-usd` in the built argv.
   harness's permission rules — noting it here because the same lock will
   reappear the next time a git write races with a git read and it is
   worth knowing the recovery does not need `rm`.
+
+## Report — 2026-09-02 (second session, README pass)
+
+Closes the round. Item 5's README half is done and the frontmatter is
+now `status: done`. This is a separate section on purpose — the first
+report is the record of what happened when the run hit the cap, and
+overwriting it would lose the point.
+
+### What changed in the README
+
+Three edits, all in the places the brief names:
+
+- The tool table rows for `cc_run` and `cc_ask` now show the optional
+  `budget_usd` parameter, the default and ceiling, and the fact that
+  `cc_status` prints an unmissable `BUDGET: CAP HIT` line when the cap
+  was hit.
+- The "What this server can do to this machine unattended" section no
+  longer says a flat `$2.00` cap. It now says default $2.00, caller may
+  raise up to a $20.00 ceiling, the bridge never passes more than the
+  ceiling, out-of-range values are rejected rather than clamped, and
+  the ceiling itself moves only by a deliberate `config.py` edit.
+- The contract-check bullet list gains the `BUDGET: CAP HIT` line, with
+  a sentence explaining *why* it is separate from the report-contract
+  lines (a cap-hit run and a botched run need different responses).
+
+### The finding worth a decision — python bypasses the shell deny list
+
+Recorded in the README under "Known limitation" for future readers, and
+raised here as a follow-up worth Chris's decision.
+
+`python3` and `python` are on the *allow* list because tests, scripts
+and formatters need them. Anything a denied shell command could do, a
+CC session can still reach by calling it from Python: `import os;
+os.unlink(path)` hits the same syscall as `rm`; `urllib.request` reaches
+the same one as `curl`; `subprocess.run(["ssh", ...])` bypasses the
+`Bash(ssh:*)` deny entirely. This isn't theoretical — I ran into it
+today with the stale `.git/index.lock`, and only then noticed the deny
+list is not the wall it reads like.
+
+So the shell denies are a speed bump against accidents, not a boundary
+against a determined session. The real containment is elsewhere: the
+`~/Donkey_Betz/` cwd bound, the one-run-per-cwd lock, the missing
+`WebFetch`/`WebSearch`, and the budget cap. That is probably fine —
+this is your machine, running your code, on your subscription — but it
+is worth being explicit about, so the deny list is not read as
+providing more assurance than it does.
+
+Options if you want to close this gap:
+
+1. **Do nothing, keep the doc.** The written-down limitation is
+   itself a partial fix — it stops the next reader (or the next Cowork
+   session) from mis-reading the deny list.
+2. **Drop `python`/`python3` from the allow list, route through
+   specific runners only** (`pytest`, `ruff`, `mypy`, etc, which are
+   already there). Costs: any test file that shells out to `python` for
+   a repro step or a manage.py breaks; scripts under `bin/` that use a
+   `#!/usr/bin/env python3` still work because that's an exec, not a
+   `Bash(python:*)` invocation.
+3. **Add a `python` invocation allowlist** (`Bash(python:*.py)` /
+   `Bash(python -m pytest:*)` etc), so the common cases still work but
+   arbitrary `python -c` payloads are refused. Adds real friction, and
+   the existing allowlist syntax may not express this cleanly.
+
+**Recommendation: option 1** for now — document it, revisit if the
+bridge starts running for untrusted callers. It is a real limitation,
+but the risk profile with the current caller (Cowork, driven by you)
+does not warrant the friction of options 2 or 3.
+
+### Ask-list checklist — everything now marked
+
+- [x] `runner.start_run` builds a prompt that tells CC to do the work
+      and not to stop for confirmation, with a comment saying why
+- [x] `config.py` has both a default and a ceiling, each commented
+- [x] `start_run` and `start_ask` take an optional `budget_usd`,
+      validate it against the ceiling, and raise `BridgeError` on a
+      bad value
+- [x] `start_ask` inherits the prior job's budget when none is given
+      (and tolerates a prior `meta.json` with no `budget_usd` key)
+- [x] the resolved budget is written to `meta.json` as `budget_usd`
+- [x] `cc_run` and `cc_ask` expose `budget_usd`, descriptions updated,
+      all five tools still `structured_output=False`
+- [x] `cc_status` and `cc_result` both show the budget, and both show
+      an unmissable `BUDGET: CAP HIT` line when the cap was hit
+- [x] `TASK_cut-web-tools.md` is at `docs/tasks/` via `git mv`,
+      contents unchanged, references checked
+- [x] `pytest` passes — 22 passed, 0 failed
+- [x] **README updated in the three places named in Item 5** (this
+      session)
+- [x] commits — five total across the two sessions (source edits,
+      `git mv`, tests, first report, README + second report), none
+      pushed
+- [x] not pushed
+- [x] a dated `## Report — 2026-09-02` section appended (two of them
+      now — the first records the cap-hit split, this one closes the
+      round), frontmatter `status:` set to `done`
+
+### Nothing new is live yet
+
+The MCP server still runs the old code in memory. Chris restarts the
+desktop app, then a fresh `cc_run` picks up the new prompt, the
+`budget_usd` argument, and the cap-visibility lines.
+
 
