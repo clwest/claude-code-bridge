@@ -27,7 +27,16 @@ MAX_BUDGET_USD = "2.00"
 # clamped — see runner._validate_budget. Raise this only after a
 # deliberate conversation about blast radius; a runaway CC session that
 # is allowed to spend more can also make more of a mess.
-MAX_BUDGET_CEILING_USD = "20.00"
+#
+# Raised 20 → 50 on 2026-09-04, Chris's call, after a night where three
+# of eight runs hit their cap. Two separate problems and this fixes one
+# of them: the briefs were multi-part and priced at $12-18, and $20 was
+# a wall you could not price past even knowing better. A three-part
+# brief with a migration is a $25-30 run. The other problem — writing a
+# three-part brief at all when three briefs would do — is a habit, not
+# a constant, and raising this does not fix it. A badly scoped run
+# allowed to spend more just fails later and more expensively.
+MAX_BUDGET_CEILING_USD = "50.00"
 
 # Wall-clock ceiling on every job, in seconds. Overridable per run via
 # cc_run/cc_ask up to MAX_JOB_TIMEOUT_S. 45 minutes is set as the default

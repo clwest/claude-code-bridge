@@ -17,10 +17,10 @@ Six tools. That's the whole surface.
 
 | Tool | What it does |
 |---|---|
-| `cc_run(task_file, cwd, budget_usd=None, timeout_s=None)` | Start a headless CC session in `cwd`, telling it to do the work in `task_file` now (not to ask for confirmation). Refuses non-`TASK_*.md` inputs, refuses cwds outside `~/Donkey_Betz/`, refuses if another job is already running in that cwd — a stale job past its wall-clock deadline is reaped first, and the reap is announced in the return. Optional `budget_usd` overrides the default $2.00 per-run cap, up to a ceiling of $20.00. Optional `timeout_s` overrides the default 45-minute wall-clock ceiling, up to 8 hours. Returns a `job_id`. |
+| `cc_run(task_file, cwd, budget_usd=None, timeout_s=None)` | Start a headless CC session in `cwd`, telling it to do the work in `task_file` now (not to ask for confirmation). Refuses non-`TASK_*.md` inputs, refuses cwds outside `~/Donkey_Betz/`, refuses if another job is already running in that cwd — a stale job past its wall-clock deadline is reaped first, and the reap is announced in the return. Optional `budget_usd` overrides the default $2.00 per-run cap, up to a ceiling of $50.00. Optional `timeout_s` overrides the default 45-minute wall-clock ceiling, up to 8 hours. Returns a `job_id`. |
 | `cc_status(job_id)` | running / finished / killed / timeout, elapsed seconds, budget, timeout, and the last few lines of stdout+stderr. If the budget cap was hit, a `BUDGET: CAP HIT` line makes that unmissable. If the job was killed or timed out, `ended_reason:` names it. |
 | `cc_result(job_id)` | The full final output once finished, plus a **CONTRACT CHECK** (see below). If the job is still running, returns a `still running` message instead of the final output. A killed or timed-out job carries `ended_reason:` at the top so a stopped run is never indistinguishable from one that ran to completion. |
-| `cc_ask(job_id, prompt, budget_usd=None, timeout_s=None)` | A follow-up question **into the same CC session** (resumed by `session_id`). Optional `budget_usd` overrides the inherited budget from the prior job (default $2.00, ceiling $20.00). Optional `timeout_s` overrides the inherited wall-clock ceiling (default 45 min, ceiling 8 h). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
+| `cc_ask(job_id, prompt, budget_usd=None, timeout_s=None)` | A follow-up question **into the same CC session** (resumed by `session_id`). Optional `budget_usd` overrides the inherited budget from the prior job (default $2.00, ceiling $50.00). Optional `timeout_s` overrides the inherited wall-clock ceiling (default 45 min, ceiling 8 h). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
 | `cc_kill(job_id)` | Stop a running job on purpose. Only kills the pid recorded in that job's `meta.json` — never a pid, name or pattern from the caller. Sends SIGTERM, waits 5 seconds, sends SIGKILL if still alive. Records `ended_reason: killed` and which signal actually ended it, and says whether the cwd is free afterwards. On an already-ended job, says so and does nothing. |
 | `cc_list()` | Every job this bridge has started, with cwd and current state. |
 
@@ -147,7 +147,7 @@ The bridge starts `claude --print …` subprocesses. Each subprocess is a
 full Claude Code session with the tool allow/deny lists below, pinned by
 this server on every spawn. Every invocation gets its own
 `--max-budget-usd` cap: the default is **$2.00** USD, and a caller may
-raise it per-run up to a hard ceiling of **$20.00** — the bridge will
+raise it per-run up to a hard ceiling of **$50.00** — the bridge will
 never pass more than the ceiling, and rejects out-of-range values rather
 than silently clamping them. Note this is a *per-invocation* cap, not a
 per-session cap: a `cc_ask` on the same session gets its own budget
