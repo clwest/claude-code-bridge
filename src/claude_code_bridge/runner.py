@@ -252,6 +252,10 @@ def cap_hit(view: "JobView") -> bool:
 # spawn. The helper never lets a git failure fail the run.
 _GIT_TIMEOUT_S = 5.0
 
+# Wall clock on cc_push. A push that hangs on the network must not hang the
+# tool; 120s is generous for a real push and firm enough to bound the wait.
+_PUSH_TIMEOUT_S = 120.0
+
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run a git subprocess with an explicit cwd and a short timeout.
@@ -267,6 +271,26 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=_GIT_TIMEOUT_S,
         check=True,
+    )
+
+
+def _git_capture(
+    args: list[str],
+    cwd: Path,
+    timeout: float = _GIT_TIMEOUT_S,
+) -> subprocess.CompletedProcess[str]:
+    """Run a git subprocess without check=True so the caller inspects returncode.
+
+    Used by push_branch where non-zero exits are expected outcomes (no
+    upstream yet, remote-tracking ref missing, rejection by remote) and
+    should not raise a CalledProcessError we then have to catch.
+    """
+    return subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
 
 
@@ -890,3 +914,146 @@ def tail(path: Path, n_lines: int = 20) -> str:
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()
     return "\n".join(lines[-n_lines:])
+
+
+def _summarize_push_failure(stderr: str) -> str:
+    """One-line reason from git push stderr — the operative bit, not a wall.
+
+    git puts the useful line first with '! [rejected]' or 'error:' /
+    'fatal:'; we return the first such line, stripped. Falls back to the
+    last non-empty line so a differently-shaped failure still says
+    something meaningful.
+    """
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    if not lines:
+        return "git push failed with no message"
+    for ln in lines:
+        low = ln.lower()
+        if ln.startswith("!") or "rejected" in low or low.startswith("error:") or low.startswith("fatal:"):
+            return ln
+    return lines[-1]
+
+
+def push_branch(cwd: str, remote: str = "origin") -> dict:
+    """Publish the current branch's commits on `remote` for `cwd`.
+
+    Deliberately no argument passthrough beyond cwd and remote — there is
+    no way to reach --force, --force-with-lease, --delete, --tags or a
+    refspec from outside this function. Same-shape reasoning as cc_kill:
+    the sanctioned way through is the tool, and the Bash(git push:*) deny
+    in config.py stays as-is.
+
+    Returns a dict describing what happened:
+      branch, remote_name, remote_url, sha_before_local,
+      sha_before_remote (None for a new branch), sha_after_remote,
+      commits_pushed (0 for up_to_date), status
+      ("pushed" | "up_to_date" | "new_branch"), message.
+
+    Refuses (raises BridgeError) on:
+      - cwd outside WORKSPACE_ROOT (reuses _validate_cwd, the same code
+        path cc_run uses).
+      - remote name starting with '-' (would otherwise be read as a git flag).
+      - the named remote not configured.
+      - detached HEAD (names the SHA in the message).
+      - a non-fast-forward / otherwise rejected push (reports git's own
+        reason on one line and says the branch was not published).
+      - git push wall clock past _PUSH_TIMEOUT_S.
+    """
+    cwd_p = _validate_cwd(cwd)
+
+    if not remote or remote.startswith("-"):
+        raise BridgeError(f"remote name {remote!r} is not allowed")
+
+    try:
+        remote_url_proc = _git_capture(["remote", "get-url", remote], cwd_p)
+    except FileNotFoundError as exc:
+        raise BridgeError("git not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise BridgeError("git timed out resolving the remote URL") from exc
+    if remote_url_proc.returncode != 0:
+        raise BridgeError(
+            f"remote {remote!r} is not configured in {cwd_p}"
+        )
+    remote_url = remote_url_proc.stdout.strip()
+
+    branch_proc = _git_capture(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd_p)
+    if branch_proc.returncode != 0:
+        head_proc = _git_capture(["rev-parse", "HEAD"], cwd_p)
+        head = head_proc.stdout.strip() or "unknown"
+        raise BridgeError(
+            f"detached HEAD at {head[:7]}; check out a branch before pushing"
+        )
+    branch = branch_proc.stdout.strip()
+
+    local_sha = _git_capture(["rev-parse", "HEAD"], cwd_p).stdout.strip()
+
+    remote_ref = f"refs/remotes/{remote}/{branch}"
+    remote_before_proc = _git_capture(["rev-parse", "--verify", remote_ref], cwd_p)
+    remote_sha_before: str | None
+    if remote_before_proc.returncode == 0:
+        remote_sha_before = remote_before_proc.stdout.strip()
+    else:
+        remote_sha_before = None
+
+    upstream_proc = _git_capture(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd_p
+    )
+    has_upstream = upstream_proc.returncode == 0
+
+    push_argv = ["push"]
+    if not has_upstream:
+        push_argv.append("--set-upstream")
+    push_argv += [remote, branch]
+
+    try:
+        push_proc = _git_capture(push_argv, cwd_p, timeout=_PUSH_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise BridgeError(
+            f"git push timed out after {_PUSH_TIMEOUT_S:.0f}s; "
+            f"branch {branch} was not published"
+        ) from exc
+
+    if push_proc.returncode != 0:
+        reason = _summarize_push_failure(push_proc.stderr or push_proc.stdout)
+        raise BridgeError(
+            f"push rejected: {reason}; branch {branch} was not published"
+        )
+
+    remote_after_proc = _git_capture(["rev-parse", "--verify", remote_ref], cwd_p)
+    remote_sha_after = (
+        remote_after_proc.stdout.strip()
+        if remote_after_proc.returncode == 0
+        else local_sha
+    )
+
+    new_branch = remote_sha_before is None
+    if new_branch:
+        # A brand-new branch published its full history. Count reachable
+        # commits so the caller sees a real number, not just "created".
+        count_proc = _git_capture(["rev-list", "--count", local_sha], cwd_p)
+        commits_pushed = int(count_proc.stdout.strip() or "0")
+        status = "new_branch"
+        message = f"created remote branch {branch} with {commits_pushed} commits"
+    elif remote_sha_before == local_sha:
+        commits_pushed = 0
+        status = "up_to_date"
+        message = "already up to date"
+    else:
+        count_proc = _git_capture(
+            ["rev-list", "--count", f"{remote_sha_before}..{local_sha}"], cwd_p
+        )
+        commits_pushed = int(count_proc.stdout.strip() or "0")
+        status = "pushed"
+        message = f"pushed {commits_pushed} commit{'s' if commits_pushed != 1 else ''}"
+
+    return {
+        "branch": branch,
+        "remote_name": remote,
+        "remote_url": remote_url,
+        "sha_before_local": local_sha,
+        "sha_before_remote": remote_sha_before,
+        "sha_after_remote": remote_sha_after,
+        "commits_pushed": commits_pushed,
+        "status": status,
+        "message": message,
+    }

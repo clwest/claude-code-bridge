@@ -8,6 +8,7 @@ Usage:
     claude-code-bridge-cli kill <job_id>
     claude-code-bridge-cli list
     claude-code-bridge-cli wait <job_id> [--timeout SECS]
+    claude-code-bridge-cli push <cwd> [--remote origin]
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ import sys
 import time
 
 from .runner import BridgeError
-from .server import cc_ask, cc_kill, cc_list, cc_result, cc_run, cc_status
+from .server import cc_ask, cc_kill, cc_list, cc_push, cc_result, cc_run, cc_status
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -46,6 +47,11 @@ def _cmd_kill(args: argparse.Namespace) -> int:
 
 def _cmd_list(_: argparse.Namespace) -> int:
     print(cc_list())
+    return 0
+
+
+def _cmd_push(args: argparse.Namespace) -> int:
+    print(cc_push(args.cwd, args.remote))
     return 0
 
 
@@ -90,6 +96,11 @@ def main() -> None:
 
     lst = sub.add_parser("list", help="list all jobs")
     lst.set_defaults(func=_cmd_list)
+
+    ph = sub.add_parser("push", help="publish current branch (git push)")
+    ph.add_argument("cwd")
+    ph.add_argument("--remote", default="origin")
+    ph.set_defaults(func=_cmd_push)
 
     w = sub.add_parser("wait", help="poll until finished")
     w.add_argument("job_id")

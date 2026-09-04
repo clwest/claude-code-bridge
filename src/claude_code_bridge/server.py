@@ -36,6 +36,7 @@ from .runner import (
     kill_job,
     list_jobs,
     load_job,
+    push_branch,
     start_ask,
     start_run,
     tail,
@@ -405,6 +406,43 @@ def cc_list() -> str:
         if not views:
             return "(no jobs yet)"
         return "\n".join(_format_job_line(v) for v in views)
+    except Exception as exc:
+        return _friendly_error(exc)
+
+
+@server.tool(
+    name="cc_push",
+    description=(
+        "Publish the current branch's commits from `cwd` to `remote` "
+        "(default 'origin'). This is the only sanctioned way through — "
+        "the Bash(git push:*) deny in config stays as-is, same shape as "
+        "cc_kill being the only sanctioned way to end a job. Deliberately "
+        "no argument passthrough: --force, --force-with-lease, --delete, "
+        "--tags and refspecs are unreachable from outside. Refuses cwds "
+        "outside ~/Donkey_Betz/, refuses a detached HEAD, refuses a "
+        "non-fast-forward and reports git's own reason on one line. "
+        "'Already up to date' is a normal result, not an error. Missing "
+        "upstream is pushed with --set-upstream and the return says a "
+        "new remote branch was created. 120s wall-clock; a push that "
+        "hangs on the network will not hang the tool."
+    ),
+    structured_output=False,
+)
+def cc_push(cwd: str, remote: str = "origin") -> str:
+    """Publish commits via git. No argument passthrough by design."""
+    try:
+        result = push_branch(cwd, remote=remote)
+        before = _short(result["sha_before_remote"]) if result["sha_before_remote"] else "(new)"
+        after = _short(result["sha_after_remote"])
+        lines = [
+            result["message"],
+            f"branch: {result['branch']}",
+            f"remote: {result['remote_name']} ({result['remote_url']})",
+            f"remote SHA before: {before}",
+            f"remote SHA after:  {after}",
+            f"commits published: {result['commits_pushed']}",
+        ]
+        return "\n".join(lines)
     except Exception as exc:
         return _friendly_error(exc)
 

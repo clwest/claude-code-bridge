@@ -13,7 +13,7 @@ reviewer still reads to the end. What goes away is the human relay.
 
 ## What it exposes
 
-Six tools. That's the whole surface.
+Seven tools. That's the whole surface.
 
 | Tool | What it does |
 |---|---|
@@ -23,6 +23,7 @@ Six tools. That's the whole surface.
 | `cc_ask(job_id, prompt, budget_usd=None, timeout_s=None)` | A follow-up question **into the same CC session** (resumed by `session_id`). Optional `budget_usd` overrides the inherited budget from the prior job (default $2.00, ceiling $50.00). Optional `timeout_s` overrides the inherited wall-clock ceiling (default 45 min, ceiling 8 h). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
 | `cc_kill(job_id)` | Stop a running job on purpose. Only kills the pid recorded in that job's `meta.json` — never a pid, name or pattern from the caller. Sends SIGTERM, waits 5 seconds, sends SIGKILL if still alive. Records `ended_reason: killed` and which signal actually ended it, and says whether the cwd is free afterwards. On an already-ended job, says so and does nothing. |
 | `cc_list()` | Every job this bridge has started, with cwd and current state. |
+| `cc_push(cwd, remote="origin")` | Publish the current branch's commits from `cwd` on `remote`. The only sanctioned way through — `Bash(git push:*)` in the deny list stays as-is. Deliberately no argument passthrough: `--force`, `--force-with-lease`, `--delete`, `--tags` and refspecs are unreachable from outside this tool. Refuses a detached HEAD (names the SHA), reports a non-fast-forward with git's own reason on one line and says the branch was not published, treats "already up to date" as a normal result, and pushes with `--set-upstream` when no upstream is set (the return says a new remote branch was created). Returns branch, remote name and URL, remote SHA before and after, and how many commits were published. 120s wall clock. |
 
 ## The contract check
 
@@ -82,6 +83,35 @@ The bridge now handles that itself, two ways:
   itself**, and it says so plainly in the return — "Reaped stale job
   X (timeout). Started job Y." — so nobody mistakes the reaping for
   their own job failing.
+
+## Publishing commits: `cc_push` and why the Bash deny stays
+
+`Bash(git push:*)` is in the deny list and stays there. The only sanctioned
+way to publish a commit through this bridge is `cc_push`.
+
+Two things fall out of that:
+
+- **No credential lives in the workspace.** A stored token would have to sit
+  in a file readable by every later Claude Code run and every future session,
+  which is the same shape as the incident that put a PyPI token into a
+  permission file. `cc_push` runs on the Mac and inherits the user's
+  environment, so the macOS keychain credential helper answers on its own
+  — no new secret anywhere.
+- **The deny is a design surface, not a hurdle to be routed around.** On
+  earlier runs a push occasionally came out through `Bash(python:*)`, which
+  is allowlisted and reaches `subprocess`. Making that the routine path
+  would turn a known hole in the boundary (see "Known limitation" further
+  down) into the process. `cc_push` gives CC a first-class way through
+  that goes only where the deny already permits by other means.
+
+`cc_push` has no argument passthrough. `--force`, `--force-with-lease`,
+`--delete`, `--tags` and refspecs are unreachable from outside the tool
+because there is no parameter that would carry them. A detached HEAD is
+refused (with the SHA in the message); a non-fast-forward push is refused
+with git's own reason on one line and a plain "branch was not published";
+"already up to date" is a normal return; a branch with no upstream is
+pushed with `--set-upstream` and the return says a new remote branch was
+created. 120s wall clock so a hung network cannot hang the tool.
 
 ## Recovering from a run
 
