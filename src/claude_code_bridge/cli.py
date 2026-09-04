@@ -14,10 +14,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 
 from .runner import BridgeError
-from .server import cc_ask, cc_kill, cc_list, cc_push, cc_result, cc_run, cc_status
+from .server import cc_ask, cc_kill, cc_list, cc_push, cc_result, cc_run, cc_status, cc_wait
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -56,16 +55,9 @@ def _cmd_push(args: argparse.Namespace) -> int:
 
 
 def _cmd_wait(args: argparse.Namespace) -> int:
-    deadline = time.time() + args.timeout
-    while time.time() < deadline:
-        out = cc_status(args.job_id)
-        if "state: running" not in out:
-            print(out)
-            return 0
-        time.sleep(args.poll)
-    print(cc_status(args.job_id))
-    print(f"(timeout after {args.timeout}s)", file=sys.stderr)
-    return 1
+    out = cc_wait(args.job_id, timeout_s=args.timeout)
+    print(out)
+    return 1 if out.startswith("wait: timed out") else 0
 
 
 def main() -> None:
@@ -102,10 +94,9 @@ def main() -> None:
     ph.add_argument("--remote", default="origin")
     ph.set_defaults(func=_cmd_push)
 
-    w = sub.add_parser("wait", help="poll until finished")
+    w = sub.add_parser("wait", help="block until finished (uses cc_wait)")
     w.add_argument("job_id")
-    w.add_argument("--timeout", type=float, default=600.0)
-    w.add_argument("--poll", type=float, default=2.0)
+    w.add_argument("--timeout", type=float, default=300.0)
     w.set_defaults(func=_cmd_wait)
 
     args = p.parse_args()

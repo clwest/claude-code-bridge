@@ -18,7 +18,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-REPORT_HEADING_RE = re.compile(r"^##\s+Report\s*[—-]\s*(\d{4}-\d{2}-\d{2})", re.M)
+# Match a Report heading at any level (`#` through `######`) with `Report`
+# as the first word after the hashes and a word boundary afterwards. That
+# admits every shape that has actually appeared in a task file here:
+#
+#   ## Report
+#   ## Report — 2026-09-04
+#   ## Report — 2026-09-04 (macOS run)
+#   ## Report — 2026-09-04 — fix pass after Cowork's review
+#   # Report — 2026-09-04                      (H1; the shape that made the
+#                                               old `##`-only regex cry wolf
+#                                               on 2026-09-04)
+#
+# The word boundary keeps `## Reporting` and `## Reports` out; it does not
+# distinguish a real report from a brief's `## Report back` (a request for
+# a report, not a report). We rely on `report_added_by_this_run` to sort
+# that case out: a stale brief-heading still present after the run reads as
+# "present (but not added by this run — check date)", which is the
+# yellow-flag phrasing already in `render()`.
+REPORT_HEADING_RE = re.compile(r"^#{1,6}\s+Report\b.*$", re.M)
 CHECKLIST_RE = re.compile(r"^\s*-\s*\[[ xX]\]", re.M)
 STATUS_LINE_RE = re.compile(r"^status:\s*(\S.*?)\s*$", re.M)
 

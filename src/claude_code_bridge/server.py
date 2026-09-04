@@ -40,6 +40,7 @@ from .runner import (
     start_ask,
     start_run,
     tail,
+    wait_for_job,
 )
 
 
@@ -309,6 +310,34 @@ def cc_result(job_id: str) -> str:
         if stderr_text.strip():
             body += "\n\n--- CC STDERR ---\n" + stderr_text
         return header + body
+    except Exception as exc:
+        return _friendly_error(exc)
+
+
+@server.tool(
+    name="cc_wait",
+    description=(
+        "Block until the given job ends, then return exactly what "
+        "cc_status would return at that moment. If the job is already "
+        "finished, return immediately (no initial sleep). Optional "
+        "`timeout_s` bounds how long to block (default 300s; capped at "
+        "the job's own wall-clock ceiling — no point waiting longer than "
+        "the job can run). If the wait expires while the job is still "
+        "running, the return prefixes cc_status with 'wait: timed out "
+        "(job still running)' — that is a normal result, not an error, "
+        "and the caller can wait again. The job's own wall-clock ceiling "
+        "is never extended, shortened or touched by this call."
+    ),
+    structured_output=False,
+)
+def cc_wait(job_id: str, timeout_s: float | None = None) -> str:
+    """Block until the job ends, then return cc_status."""
+    try:
+        _, timed_out = wait_for_job(job_id, timeout_s=timeout_s)
+        status = cc_status(job_id)
+        if timed_out:
+            return "wait: timed out (job still running)\n" + status
+        return status
     except Exception as exc:
         return _friendly_error(exc)
 

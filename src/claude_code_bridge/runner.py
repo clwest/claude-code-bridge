@@ -51,6 +51,14 @@ _KILL_GRACE_S = 5.0
 # fine — the grace period is measured in seconds, not milliseconds.
 _KILL_POLL_S = 0.1
 
+# Default and poll interval for cc_wait. The default (five minutes) is
+# a compromise: long enough that a caller does not sit in a tight
+# poll-sleep-poll ladder for a job that finishes on human timescales,
+# short enough that a stuck wait does not sit forever unattended.
+# The wait ceiling is always the job's own timeout — see wait_for_job.
+DEFAULT_WAIT_TIMEOUT_S = 5 * 60
+_WAIT_POLL_S = 1.0
+
 
 class BridgeError(Exception):
     """Raised for policy violations and validation failures."""
@@ -852,6 +860,74 @@ def kill_job(job_id: str) -> dict:
         "ended_reason": "killed",
         "cwd_free": cwd_free,
     }
+
+
+def _validate_wait_timeout(
+    timeout_s: float | int | str | None,
+    job_timeout_s: float | None,
+) -> float:
+    """Return a wait timeout in seconds, or raise BridgeError.
+
+    The wait timeout is the caller's ceiling on how long to block; it
+    has nothing to do with the job's own wall-clock deadline. Task
+    spec: "The wait's timeout is its own, independent of the job's
+    wall-clock ceiling, and waiting must never extend, shorten or
+    otherwise touch that ceiling." The cap here is only there so a
+    caller cannot wait longer than the job could conceivably run —
+    that would be dead time, not correctness.
+    """
+    if timeout_s is None:
+        value = float(DEFAULT_WAIT_TIMEOUT_S)
+    else:
+        try:
+            value = float(timeout_s)
+        except (TypeError, ValueError) as exc:
+            raise BridgeError(
+                f"timeout_s must be a number (got {timeout_s!r})"
+            ) from exc
+        if value != value or value <= 0:  # NaN or non-positive
+            raise BridgeError(
+                f"timeout_s must be greater than 0 (got {value})"
+            )
+    if job_timeout_s is not None and value > float(job_timeout_s):
+        value = float(job_timeout_s)
+    return value
+
+
+def wait_for_job(
+    job_id: str,
+    timeout_s: float | int | str | None = None,
+) -> tuple["JobView", bool]:
+    """Block until the job ends, then return (view, wait_timed_out).
+
+    `wait_timed_out=True` means our own wait deadline expired while the
+    job was still running — the job keeps going, its own wall-clock
+    ceiling is untouched, and the caller can wait again. This is NOT
+    an error and callers must not phrase it as one.
+
+    Returns immediately (no initial sleep) if the job is already
+    finished when we look. Otherwise polls at `_WAIT_POLL_S` — a
+    modest interval, not a busy loop — and re-reads job state via
+    `load_job` on each pass, so `_finalize_if_dead` catches the
+    exit_code file the wrapper drops.
+    """
+    view = load_job(job_id)
+    wait_timeout = _validate_wait_timeout(
+        timeout_s, view.meta.get("timeout_s")
+    )
+    if not is_running(view):
+        return view, False
+
+    deadline = time.time() + wait_timeout
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        time.sleep(min(_WAIT_POLL_S, max(remaining, 0.0)))
+        view = load_job(job_id)
+        if not is_running(view):
+            return view, False
+
+    view = load_job(job_id)
+    return view, is_running(view)
 
 
 def load_job(job_id: str) -> JobView:
