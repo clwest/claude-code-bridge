@@ -29,6 +29,23 @@ MAX_BUDGET_USD = "2.00"
 # is allowed to spend more can also make more of a mess.
 MAX_BUDGET_CEILING_USD = "20.00"
 
+# Wall-clock ceiling on every job, in seconds. Overridable per run via
+# cc_run/cc_ask up to MAX_JOB_TIMEOUT_S. 45 minutes is set as the default
+# because the longest legitimate run seen so far was ~22 minutes of real
+# work, so 45m has margin without ever having tripped honest work — see
+# TASK_cc-kill-and-wall-clock-timeout.md for the whole rationale.
+#
+# Enforcement is lazy: a job past its deadline is killed by the next call
+# that touches it (cc_status, cc_result, or a blocked cc_run trying to
+# start in the same cwd). There is no daemon, no background thread.
+DEFAULT_JOB_TIMEOUT_S = 45 * 60
+
+# The most the bridge will ever accept for a per-run timeout, in seconds.
+# 8 hours is way more than any real CC session will need; the ceiling
+# exists so a caller cannot dial a job's timeout up to something absurd
+# like "never" and defeat the point of having one.
+MAX_JOB_TIMEOUT_S = 8 * 60 * 60
+
 # --permission-mode default: in --print mode, an unresolvable permission
 # prompt fails cleanly rather than hanging. Combined with the allow/deny
 # lists below, this gives us a headless run that either does allowed work

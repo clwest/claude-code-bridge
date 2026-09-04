@@ -13,14 +13,15 @@ reviewer still reads to the end. What goes away is the human relay.
 
 ## What it exposes
 
-Five tools. That's the whole surface.
+Six tools. That's the whole surface.
 
 | Tool | What it does |
 |---|---|
-| `cc_run(task_file, cwd, budget_usd=None)` | Start a headless CC session in `cwd`, telling it to do the work in `task_file` now (not to ask for confirmation). Refuses non-`TASK_*.md` inputs, refuses cwds outside `~/Donkey_Betz/`, refuses if another job is already running in that cwd. Optional `budget_usd` overrides the default $2.00 per-run cap, up to a ceiling of $20.00. Returns a `job_id`. |
-| `cc_status(job_id)` | running / finished, elapsed seconds, budget, and the last few lines of stdout+stderr. If the budget cap was hit, a `BUDGET: CAP HIT` line makes that unmissable. |
-| `cc_result(job_id)` | The full final output once finished, plus a **CONTRACT CHECK** (see below). If the job is still running, returns a `still running` message instead of the final output. |
-| `cc_ask(job_id, prompt, budget_usd=None)` | A follow-up question **into the same CC session** (resumed by `session_id`). Optional `budget_usd` overrides the inherited budget from the prior job (default $2.00, ceiling $20.00). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
+| `cc_run(task_file, cwd, budget_usd=None, timeout_s=None)` | Start a headless CC session in `cwd`, telling it to do the work in `task_file` now (not to ask for confirmation). Refuses non-`TASK_*.md` inputs, refuses cwds outside `~/Donkey_Betz/`, refuses if another job is already running in that cwd — a stale job past its wall-clock deadline is reaped first, and the reap is announced in the return. Optional `budget_usd` overrides the default $2.00 per-run cap, up to a ceiling of $20.00. Optional `timeout_s` overrides the default 45-minute wall-clock ceiling, up to 8 hours. Returns a `job_id`. |
+| `cc_status(job_id)` | running / finished / killed / timeout, elapsed seconds, budget, timeout, and the last few lines of stdout+stderr. If the budget cap was hit, a `BUDGET: CAP HIT` line makes that unmissable. If the job was killed or timed out, `ended_reason:` names it. |
+| `cc_result(job_id)` | The full final output once finished, plus a **CONTRACT CHECK** (see below). If the job is still running, returns a `still running` message instead of the final output. A killed or timed-out job carries `ended_reason:` at the top so a stopped run is never indistinguishable from one that ran to completion. |
+| `cc_ask(job_id, prompt, budget_usd=None, timeout_s=None)` | A follow-up question **into the same CC session** (resumed by `session_id`). Optional `budget_usd` overrides the inherited budget from the prior job (default $2.00, ceiling $20.00). Optional `timeout_s` overrides the inherited wall-clock ceiling (default 45 min, ceiling 8 h). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
+| `cc_kill(job_id)` | Stop a running job on purpose. Only kills the pid recorded in that job's `meta.json` — never a pid, name or pattern from the caller. Sends SIGTERM, waits 5 seconds, sends SIGKILL if still alive. Records `ended_reason: killed` and which signal actually ended it, and says whether the cwd is free afterwards. On an already-ended job, says so and does nothing. |
 | `cc_list()` | Every job this bridge has started, with cwd and current state. |
 
 ## The contract check
@@ -50,6 +51,37 @@ top of the result:
 The bridge does **not** fix any of these. It makes them impossible to
 miss. Cowork then uses `cc_ask` to send it back — which is exactly what
 Chris did by hand on 2026-07-22 and what Cowork did by hand on 2026-09-02.
+
+## Stopping a run: `cc_kill` and the wall-clock ceiling
+
+Two failures in two days on 2026-09-03 / 2026-09-04 held a cwd open long
+after the work was done — an internet drop that left a session hanging,
+and a cap-hit run that looked like a wedge from the outside. Both times
+Chris had to find a `claude --print` on his Mac and kill it by hand.
+The bridge now handles that itself, two ways:
+
+- **`cc_kill(job_id)`** — an explicit stop. Takes only a `job_id`, looks
+  up the pid from that job's `meta.json`, and signals only that process
+  group. No pattern-based killing (no `pkill`, no name matching), because
+  a tool that could `pkill -f "claude --print"` could also kill a
+  session Chris is running at his own keyboard. SIGTERM first, five-
+  second grace, SIGKILL if the process ignored SIGTERM. The outcome is
+  recorded as `ended_reason: killed` alongside the signal that actually
+  ended it, so `cc_status` and `cc_result` never make a killed job look
+  like one that finished.
+
+- **A 45-minute wall-clock ceiling** on every job. The default is
+  generous — the longest legitimate run so far was about 22 minutes —
+  but it exists so most jobs never need a human timeout. `cc_run` and
+  `cc_ask` both accept an optional `timeout_s` override, up to an
+  8-hour ceiling in `config.py`. Enforcement is lazy: there is no
+  daemon and no background thread. When the next call touches a job
+  past its deadline (`cc_status`, `cc_result`, or a blocked `cc_run`
+  trying to start in the same cwd), the bridge kills it and records
+  `ended_reason: timeout`. That means **the next `cc_run` unblocks
+  itself**, and it says so plainly in the return — "Reaped stale job
+  X (timeout). Started job Y." — so nobody mistakes the reaping for
+  their own job failing.
 
 ## Recovering from a run
 
@@ -124,6 +156,14 @@ asks can spend up to N × the cap in total. Raising the ceiling itself is a
 deliberate edit to `config.py`, not something a caller can do at
 runtime. The bridge itself never elevates or loosens the tool
 permissions; there is no code path that grants more.
+
+Every invocation also gets a **wall-clock ceiling** — 45 minutes by
+default, up to an 8-hour ceiling in `config.py`, overridable per run
+with `timeout_s`. A job past its deadline is killed the next time
+anything touches it (`cc_status`, `cc_result`, or a blocked `cc_run`
+in the same cwd) and recorded as `ended_reason: timeout`. This is why
+`cc_kill` exists at all — but the timeout is the reason `cc_kill` will
+almost never need to be called by hand.
 
 **Allowed, without asking:**
 
@@ -325,6 +365,7 @@ claude-code-bridge-cli run <task_file> <cwd>
 claude-code-bridge-cli status <job_id>
 claude-code-bridge-cli result <job_id>
 claude-code-bridge-cli ask <job_id> <prompt>
+claude-code-bridge-cli kill <job_id>
 claude-code-bridge-cli list
 claude-code-bridge-cli wait <job_id> [--timeout SECS]
 ```

@@ -77,7 +77,7 @@ def test_default_budget_is_two_dollars_when_none_given(tmp_path, stub_spawn):
     tf = cwd / "TASK_x.md"
     tf.write_text("---\nstatus: not started\n---\n")
 
-    job_id = runner.start_run(str(tf), str(cwd))
+    job_id = runner.start_run(str(tf), str(cwd))["job_id"]
     meta = json.loads((runner.RUNS_DIR / job_id / "meta.json").read_text())
 
     assert meta["budget_usd"] == MAX_BUDGET_USD == "2.00"
@@ -126,7 +126,7 @@ def test_start_ask_inherits_prior_budget(tmp_path, stub_spawn):
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     prev = _fabricate_prev_job(cwd, budget="5.00")
-    new_id = runner.start_ask(prev, "carry on")
+    new_id = runner.start_ask(prev, "carry on")["job_id"]
     meta = json.loads((runner.RUNS_DIR / new_id / "meta.json").read_text())
     assert meta["budget_usd"] == "5.00"
 
@@ -135,7 +135,7 @@ def test_start_ask_falls_back_to_default_when_prior_lacks_budget(tmp_path, stub_
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     prev = _fabricate_prev_job(cwd, budget=None)
-    new_id = runner.start_ask(prev, "carry on")
+    new_id = runner.start_ask(prev, "carry on")["job_id"]
     meta = json.loads((runner.RUNS_DIR / new_id / "meta.json").read_text())
     assert meta["budget_usd"] == MAX_BUDGET_USD == "2.00"
 
@@ -144,7 +144,7 @@ def test_start_ask_explicit_budget_overrides_inheritance(tmp_path, stub_spawn):
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     prev = _fabricate_prev_job(cwd, budget="5.00")
-    new_id = runner.start_ask(prev, "carry on", budget_usd=7.5)
+    new_id = runner.start_ask(prev, "carry on", budget_usd=7.5)["job_id"]
     meta = json.loads((runner.RUNS_DIR / new_id / "meta.json").read_text())
     assert meta["budget_usd"] == "7.50"
 

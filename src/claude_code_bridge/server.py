@@ -1,4 +1,4 @@
-"""MCP server: five tools that drive Claude Code headless.
+"""MCP server: six tools that drive Claude Code headless.
 
 Notes for future readers:
 
@@ -33,6 +33,7 @@ from .runner import (
     cap_hit,
     elapsed,
     is_running,
+    kill_job,
     list_jobs,
     load_job,
     start_ask,
@@ -124,14 +125,46 @@ def _friendly_error(exc: Exception) -> str:
     return f"{exc.__class__.__name__}: {exc}"
 
 
+def _state_for(view) -> str:
+    """Human-readable state including ended_reason.
+
+    "running" while alive; "finished", "killed", "timeout" once done.
+    A wrapper that died before writing exit_code shows as
+    "finished (exit unknown)" so a lost-child case is visible.
+    """
+    m = view.meta
+    if is_running(view):
+        return "running"
+    reason = m.get("ended_reason", "finished")
+    if reason == "killed":
+        return "killed"
+    if reason == "timeout":
+        return "timeout"
+    if m.get("exit_code") == "unknown":
+        return "finished (exit unknown)"
+    return "finished"
+
+
+def _format_reaped(reaped: list[dict]) -> str:
+    """Render the reap list for the top of a cc_run / cc_ask return.
+
+    Empty list → empty string. Otherwise one line per reaped job so the
+    caller sees "reaped stale job X (timeout)" and does not mistake it
+    for their own job failing.
+    """
+    if not reaped:
+        return ""
+    lines = [
+        f"Reaped stale job {r['job_id']} ({r.get('reason', 'finished')})."
+        for r in reaped
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _format_job_line(view) -> str:
     m = view.meta
-    running = is_running(view)
-    status = "running" if running else "finished"
-    if not running and m.get("exit_code") == "unknown":
-        status = "finished (exit unknown)"
     return (
-        f"{view.job_id}  [{status}]  cwd={m['cwd']}  "
+        f"{view.job_id}  [{_state_for(view)}]  cwd={m['cwd']}  "
         f"task={m.get('task_file_rel', m.get('task_file', '-'))}  "
         f"session={m['session_id']}  kind={m.get('kind', 'run')}"
     )
@@ -144,18 +177,27 @@ def _format_job_line(view) -> str:
         "telling it to do the work now (not to ask for confirmation). "
         "`task_file` must be an existing TASK_*.md under `cwd`, and `cwd` "
         "must be under ~/Donkey_Betz/. Refuses if another job is already "
-        "running in that cwd. Optional `budget_usd` overrides the default "
-        "$2.00 per-run cap, up to a ceiling of $20.00; this is Claude "
-        "Code's own cost-estimate cap on a subscription, not a bill. "
-        "Returns a job_id immediately; the CC session runs in the background."
+        "running in that cwd (a stale job past its wall-clock deadline is "
+        "reaped first, and the reap is announced in the return). Optional "
+        "`budget_usd` overrides the default $2.00 per-run cap, up to a "
+        "ceiling of $20.00; this is Claude Code's own cost-estimate cap on "
+        "a subscription, not a bill. Optional `timeout_s` overrides the "
+        "default 45-minute wall-clock ceiling, up to 8 hours. Returns a "
+        "job_id immediately; the CC session runs in the background."
     ),
     structured_output=False,  # see module docstring
 )
-def cc_run(task_file: str, cwd: str, budget_usd: float | None = None) -> str:
+def cc_run(
+    task_file: str,
+    cwd: str,
+    budget_usd: float | None = None,
+    timeout_s: float | None = None,
+) -> str:
     """Start a headless CC run on a task file."""
     try:
-        job_id = start_run(task_file, cwd, budget_usd=budget_usd)
-        return f"Started job {job_id}"
+        result = start_run(task_file, cwd, budget_usd=budget_usd, timeout_s=timeout_s)
+        prefix = _format_reaped(result.get("reaped", []))
+        return f"{prefix}Started job {result['job_id']}"
     except Exception as exc:
         return _friendly_error(exc)
 
@@ -176,10 +218,9 @@ def cc_status(job_id: str) -> str:
     try:
         view = load_job(job_id)
         m = view.meta
-        running = is_running(view)
-        state = "running" if running else "finished"
-        if not running and m.get("exit_code") == "unknown":
-            state = "finished (exit unknown)"
+        state = _state_for(view)
+        timeout_val = m.get("timeout_s")
+        timeout_str = f"{float(timeout_val):.0f}s" if timeout_val is not None else "?"
         parts = [
             f"job_id: {view.job_id}",
             f"state: {state}",
@@ -189,9 +230,17 @@ def cc_status(job_id: str) -> str:
             f"task_file: {m['task_file']}",
             f"kind: {m.get('kind', 'run')}",
             f"budget: ${m.get('budget_usd', '2.00')}",
+            f"timeout: {timeout_str}",
         ]
         if m.get("ended_at"):
             parts.append(f"ended_at: {m['ended_at']}")
+            reason = m.get("ended_reason")
+            if reason and reason != "finished":
+                sig = m.get("killed_signal")
+                if sig:
+                    parts.append(f"ended_reason: {reason} ({sig})")
+                else:
+                    parts.append(f"ended_reason: {reason}")
         pre_line = _status_pre_run_line(m.get("pre_run_git"))
         if pre_line:
             parts.append(pre_line)
@@ -233,16 +282,27 @@ def cc_result(job_id: str) -> str:
         stdout_text = view.stdout_path.read_text(errors="replace") if view.stdout_path.is_file() else ""
         stderr_text = view.stderr_path.read_text(errors="replace") if view.stderr_path.is_file() else ""
         cap = cap_hit(view)
+        m = view.meta
+        reason = m.get("ended_reason", "finished")
+        reason_line = ""
+        if reason != "finished":
+            sig = m.get("killed_signal")
+            reason_line = (
+                f"ended_reason: {reason}"
+                + (f" ({sig})" if sig else "")
+                + "\n"
+            )
         header = (
-            f"--- CONTRACT CHECK ({view.meta['task_file_rel']}) ---\n"
+            f"--- CONTRACT CHECK ({m['task_file_rel']}) ---\n"
             + (f"{_CAP_LINE}\n" if cap else "")
+            + reason_line
             + result.render()
-            + f"session_id: {view.meta['session_id']}\n"
-            + f"exit_code: {view.meta.get('exit_code', 'unknown')}  "
-            + f"budget: ${view.meta.get('budget_usd', '2.00')}\n"
-            + f"cwd: {view.meta['cwd']}\n"
+            + f"session_id: {m['session_id']}\n"
+            + f"exit_code: {m.get('exit_code', 'unknown')}  "
+            + f"budget: ${m.get('budget_usd', '2.00')}\n"
+            + f"cwd: {m['cwd']}\n"
             + f"elapsed: {elapsed(view):.1f}s\n"
-            + _recovery_block(view.meta.get("pre_run_git")) + "\n"
+            + _recovery_block(m.get("pre_run_git")) + "\n"
         )
         body = "\n--- CC OUTPUT ---\n" + (stdout_text or "(empty)")
         if stderr_text.strip():
@@ -260,15 +320,71 @@ def cc_result(job_id: str) -> str:
         "ask list, please add it' or 'clarify X'. Optional `budget_usd` "
         "overrides the inherited budget from the prior job (defaults to "
         "$2.00, ceiling $20.00; Claude Code cost-estimate cap, not a "
-        "bill). Returns a new job_id for the follow-up run."
+        "bill). Optional `timeout_s` overrides the inherited wall-clock "
+        "ceiling from the prior job (default 45 minutes, ceiling 8 "
+        "hours). Returns a new job_id for the follow-up run."
     ),
     structured_output=False,
 )
-def cc_ask(job_id: str, prompt: str, budget_usd: float | None = None) -> str:
+def cc_ask(
+    job_id: str,
+    prompt: str,
+    budget_usd: float | None = None,
+    timeout_s: float | None = None,
+) -> str:
     """Ask a follow-up in the same session."""
     try:
-        new_job_id = start_ask(job_id, prompt, budget_usd=budget_usd)
-        return f"Started follow-up job {new_job_id}"
+        result = start_ask(job_id, prompt, budget_usd=budget_usd, timeout_s=timeout_s)
+        prefix = _format_reaped(result.get("reaped", []))
+        return f"{prefix}Started follow-up job {result['job_id']}"
+    except Exception as exc:
+        return _friendly_error(exc)
+
+
+@server.tool(
+    name="cc_kill",
+    description=(
+        "Stop a running job on purpose. Only kills the pid recorded in "
+        "the job's meta.json — never a pid, name or pattern from the "
+        "caller. Sends SIGTERM, waits 5 seconds, sends SIGKILL if the "
+        "process is still alive. Records `ended_reason: killed` and "
+        "which signal actually ended it, so a killed job is never "
+        "indistinguishable from one that finished. Says whether the "
+        "cwd is free afterwards. On a job that has already ended, "
+        "returns unchanged and says so."
+    ),
+    structured_output=False,
+)
+def cc_kill(job_id: str) -> str:
+    """Stop a running job. Only the pid recorded in that job's meta."""
+    try:
+        result = kill_job(job_id)
+        if result.get("already_ended"):
+            reason = result.get("ended_reason", "finished")
+            return (
+                f"Job {job_id} was already ended ({reason}) at "
+                f"{result.get('ended_at')} — nothing to kill."
+            )
+        if result.get("already_dead"):
+            reason = result.get("ended_reason", "finished")
+            cwd_note = (
+                "cwd is free."
+                if result.get("cwd_free")
+                else "cwd is still held by another job."
+            )
+            return (
+                f"Job {job_id} (pid {result.get('pid')}) was already dead; "
+                f"finalized as {reason}. {cwd_note}"
+            )
+        cwd_note = (
+            "cwd is free."
+            if result.get("cwd_free")
+            else "cwd is still held by another job."
+        )
+        return (
+            f"Killed job {job_id} (pid {result['pid']}) with "
+            f"{result['signal']}. {cwd_note}"
+        )
     except Exception as exc:
         return _friendly_error(exc)
 

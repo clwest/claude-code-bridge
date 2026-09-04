@@ -5,6 +5,7 @@ Usage:
     claude-code-bridge-cli status <job_id>
     claude-code-bridge-cli result <job_id>
     claude-code-bridge-cli ask <job_id> <prompt>
+    claude-code-bridge-cli kill <job_id>
     claude-code-bridge-cli list
     claude-code-bridge-cli wait <job_id> [--timeout SECS]
 """
@@ -15,7 +16,7 @@ import sys
 import time
 
 from .runner import BridgeError
-from .server import cc_ask, cc_list, cc_result, cc_run, cc_status
+from .server import cc_ask, cc_kill, cc_list, cc_result, cc_run, cc_status
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -35,6 +36,11 @@ def _cmd_result(args: argparse.Namespace) -> int:
 
 def _cmd_ask(args: argparse.Namespace) -> int:
     print(cc_ask(args.job_id, args.prompt))
+    return 0
+
+
+def _cmd_kill(args: argparse.Namespace) -> int:
+    print(cc_kill(args.job_id))
     return 0
 
 
@@ -77,6 +83,10 @@ def main() -> None:
     a.add_argument("job_id")
     a.add_argument("prompt")
     a.set_defaults(func=_cmd_ask)
+
+    k = sub.add_parser("kill", help="stop a running job on purpose")
+    k.add_argument("job_id")
+    k.set_defaults(func=_cmd_kill)
 
     lst = sub.add_parser("list", help="list all jobs")
     lst.set_defaults(func=_cmd_list)

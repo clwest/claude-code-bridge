@@ -150,7 +150,7 @@ def test_non_git_cwd_records_fact_and_still_spawns(tmp_path, stub_spawn):
     tf.write_text("---\nstatus: not started\n---\n")
 
     # Must not raise.
-    job_id = runner.start_run(str(tf), str(cwd))
+    job_id = runner.start_run(str(tf), str(cwd))["job_id"]
     meta = json.loads((runner.RUNS_DIR / job_id / "meta.json").read_text())
 
     assert meta["pre_run_git"] == {"git": "not a repository"}
@@ -218,7 +218,7 @@ def test_start_run_records_pre_run_git_in_meta(tmp_path, stub_spawn):
     _init_repo(cwd)
     (cwd / "TASK_x.md").write_text("---\nstatus: not started\n---\n")
 
-    job_id = runner.start_run(str(cwd / "TASK_x.md"), str(cwd))
+    job_id = runner.start_run(str(cwd / "TASK_x.md"), str(cwd))["job_id"]
     meta = json.loads((runner.RUNS_DIR / job_id / "meta.json").read_text())
 
     pre = meta["pre_run_git"]

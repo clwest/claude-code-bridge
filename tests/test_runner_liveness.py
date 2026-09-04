@@ -136,7 +136,8 @@ def test_active_cwd_lock_releases(tmp_path):
     _wait_for_exit_file(run_dir)
 
     # First call reaps and finalizes.
-    assert runner._active_in_cwd(cwd) is None, (
+    active, _reaped = runner._active_in_cwd(cwd)
+    assert active is None, (
         f"cwd {cwd} still locked after job {job_id} finished — "
         "one-run-per-cwd would refuse subsequent runs forever"
     )

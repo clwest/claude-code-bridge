@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shlex
+import signal
 import subprocess
 import time
 import uuid
@@ -29,13 +30,26 @@ import re
 
 from .config import (
     ALLOWED_TOOLS,
+    DEFAULT_JOB_TIMEOUT_S,
     DISALLOWED_TOOLS,
     MAX_BUDGET_CEILING_USD,
     MAX_BUDGET_USD,
+    MAX_JOB_TIMEOUT_S,
     PERMISSION_MODE,
     RUNS_DIR,
     WORKSPACE_ROOT,
 )
+
+
+# Grace period between SIGTERM and SIGKILL when the bridge kills a job.
+# 5 seconds is plenty for a process that is going to exit; anything
+# longer is a process that will not go quietly, and SIGKILL is the
+# right next move. Same value for explicit cc_kill and wall-clock reap.
+_KILL_GRACE_S = 5.0
+
+# Poll interval while waiting for a signalled process to exit. 0.1s is
+# fine — the grace period is measured in seconds, not milliseconds.
+_KILL_POLL_S = 0.1
 
 
 class BridgeError(Exception):
@@ -87,6 +101,53 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _signal_pgid(pid: int, sig: int) -> None:
+    """Send `sig` to the process group led by `pid`.
+
+    `_spawn` launches every job with `start_new_session=True`, which makes
+    the bash wrapper a session (and process-group) leader. Signalling the
+    group instead of just the wrapper pid means the claude subprocess and
+    any Bash tool it started are all included — without this, killing the
+    wrapper leaves orphaned children behind.
+
+    Fails silently on ProcessLookupError (the group is already gone) and
+    PermissionError (caller cannot signal it — nothing to do here).
+    """
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _wait_dead(pid: int, timeout_s: float) -> bool:
+    """Poll until pid is dead or the timeout expires. Returns True if dead."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(_KILL_POLL_S)
+    return not _pid_alive(pid)
+
+
+def _terminate_pid(pid: int) -> str:
+    """SIGTERM the pid's group, wait, SIGKILL if still alive. Returns signal used.
+
+    Used by both `kill_job` (caller-initiated) and `_finalize_if_dead`'s
+    timeout branch (bridge-initiated). Same behaviour either way so a
+    killed-by-user job and a timed-out job look the same from the
+    OS's perspective — only the reason recorded in meta differs.
+    """
+    _signal_pgid(pid, signal.SIGTERM)
+    if _wait_dead(pid, _KILL_GRACE_S):
+        return "SIGTERM"
+    _signal_pgid(pid, signal.SIGKILL)
+    # A short second wait so meta records reflect a truly-dead pid; if
+    # the process still isn't gone after this, it is stuck in D-state
+    # and there is nothing further a signal can do.
+    _wait_dead(pid, 2.0)
+    return "SIGKILL"
+
+
 def _resolve_under(path: Path, root: Path) -> Path:
     resolved = path.expanduser().resolve()
     root_resolved = root.expanduser().resolve()
@@ -97,6 +158,37 @@ def _resolve_under(path: Path, root: Path) -> Path:
             f"path {resolved} is not under {root_resolved}"
         ) from exc
     return resolved
+
+
+def _validate_timeout(timeout_s: float | int | str | None) -> float:
+    """Return a per-run timeout in seconds, or raise BridgeError.
+
+    Zero, negative, non-numeric and above-ceiling values are rejected —
+    same shape as `_validate_budget`. The default is DEFAULT_JOB_TIMEOUT_S
+    (45 minutes); the ceiling is MAX_JOB_TIMEOUT_S. A caller who genuinely
+    needs a longer session (a books or F&I sweep, say) sets it per run.
+    """
+    if timeout_s is None:
+        return float(DEFAULT_JOB_TIMEOUT_S)
+    ceiling = float(MAX_JOB_TIMEOUT_S)
+    try:
+        value = float(timeout_s)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(
+            f"timeout_s must be a number (got {timeout_s!r}); "
+            f"ceiling is {ceiling:.0f}s"
+        ) from exc
+    if value != value or value <= 0:  # NaN or non-positive
+        raise BridgeError(
+            f"timeout_s must be greater than 0 (got {value}); "
+            f"ceiling is {ceiling:.0f}s"
+        )
+    if value > ceiling:
+        raise BridgeError(
+            f"timeout_s {value} exceeds ceiling {ceiling:.0f}s; "
+            "raise MAX_JOB_TIMEOUT_S in config.py deliberately"
+        )
+    return value
 
 
 def _validate_budget(budget_usd: float | int | str | None) -> str:
@@ -335,11 +427,21 @@ def _finalize_if_dead(meta_path: Path, meta: dict) -> dict:
          non-None code → wrapper has exited but for some reason (kill,
          write failure) never wrote `exit_code`. This also reaps the
          zombie.
-      4. Neither file nor Popen, and the pid is dead → wrapper was
+      4. Deadline exceeded and the wrapper is still alive → the
+         wall-clock ceiling from `deadline_ts`. Kill the group, mark
+         `ended_reason: "timeout"`. Lazy-reap by design (see
+         TASK_cc-kill-and-wall-clock-timeout.md): the next call that
+         touches the job clears it — including a blocked `cc_run`.
+      5. Neither file nor Popen, and the pid is dead → wrapper was
          killed and cleaned up out from under us. Mark done, exit
          code unknown.
 
-    Anything else → still running.
+    Anything else → still running. `ended_reason` distinguishes a
+    normal exit ("finished"), a caller-initiated `cc_kill` ("killed"),
+    a wall-clock timeout ("timeout"), and an out-from-under-us death
+    ("finished" with exit_code "unknown"). `cc_status` and `cc_result`
+    surface this so a killed job is never indistinguishable from one
+    that ran to completion.
     """
     if meta.get("ended_at"):
         return meta
@@ -348,6 +450,7 @@ def _finalize_if_dead(meta_path: Path, meta: dict) -> dict:
     exit_path = meta_path.parent / "exit_code"
 
     exit_code: int | str | None = None
+    ended_reason: str = "finished"
     if exit_path.is_file():
         raw = exit_path.read_text().strip()
         try:
@@ -363,30 +466,60 @@ def _finalize_if_dead(meta_path: Path, meta: dict) -> dict:
             exit_code = popen_code
         else:
             pid = meta.get("pid")
+            deadline_ts = meta.get("deadline_ts")
             if pid and _pid_alive(pid):
-                return meta  # still running
-            exit_code = "unknown"
+                if deadline_ts and time.time() > float(deadline_ts):
+                    sig_used = _terminate_pid(pid)
+                    _reap_popen(job_id)
+                    meta["killed_signal"] = sig_used
+                    ended_reason = "timeout"
+                    exit_code = "timeout"
+                else:
+                    return meta  # still running
+            else:
+                exit_code = "unknown"
 
     meta["ended_at"] = _now_iso()
     meta["ended_ts"] = time.time()
     meta["exit_code"] = exit_code
+    meta.setdefault("ended_reason", ended_reason)
     _save_meta(meta_path, meta)
     return meta
 
 
-def _active_in_cwd(cwd: Path) -> str | None:
+def _active_in_cwd(cwd: Path) -> tuple[str | None, list[dict]]:
+    """Return (active_job_id_or_None, list_of_jobs_reaped_on_this_call).
+
+    A "reaped" entry is a job whose `ended_at` was not set when we
+    entered the loop but is set now — i.e. `_finalize_if_dead`
+    finalized it here, which for the timeout branch means the bridge
+    just killed a stale process. Callers use this list to say so
+    plainly in their return, so nobody mistakes the reaping for their
+    own job failing (see TASK_cc-kill-and-wall-clock-timeout.md Part 2:
+    "the next run unblocks itself").
+    """
+    reaped: list[dict] = []
     cwd_str = str(cwd)
+    active: str | None = None
     for meta_path in _iter_jobs():
         meta = json.loads(meta_path.read_text())
         if meta.get("cwd") != cwd_str:
             continue
+        was_ended = bool(meta.get("ended_at"))
         # Finalize first, then check ended_at — a zombie wrapper with
         # an exit_code file on disk would otherwise show as running
         # forever and hold the cwd lock indefinitely.
         meta = _finalize_if_dead(meta_path, meta)
-        if not meta.get("ended_at"):
-            return meta["job_id"]
-    return None
+        if not was_ended and meta.get("ended_at"):
+            reaped.append(
+                {
+                    "job_id": meta["job_id"],
+                    "reason": meta.get("ended_reason", "finished"),
+                }
+            )
+        if active is None and not meta.get("ended_at"):
+            active = meta["job_id"]
+    return active, reaped
 
 
 def _new_job_id() -> str:
@@ -462,13 +595,26 @@ def _spawn(cmd: list[str], cwd: Path, run_dir: Path, prompt: str, job_id: str) -
     return proc.pid
 
 
-def start_run(task_file: str, cwd: str, budget_usd: float | int | str | None = None) -> str:
-    """Start a fresh headless CC run. Returns job_id."""
+def start_run(
+    task_file: str,
+    cwd: str,
+    budget_usd: float | int | str | None = None,
+    timeout_s: float | int | str | None = None,
+) -> dict:
+    """Start a fresh headless CC run.
+
+    Returns a dict: {"job_id": <id>, "reaped": [{"job_id": ..., "reason": ...}, ...]}.
+    The `reaped` list names any stale jobs finalized on this call —
+    typically empty, but a timed-out prior job in the same cwd will
+    show up here, and the caller should say so in its own return so
+    nobody mistakes the reaping for their own job failing.
+    """
     cwd_p = _validate_cwd(cwd)
     tf = _validate_task_file(task_file, cwd_p)
     budget_str = _validate_budget(budget_usd)
+    timeout_val = _validate_timeout(timeout_s)
 
-    active = _active_in_cwd(cwd_p)
+    active, reaped = _active_in_cwd(cwd_p)
     if active:
         raise BridgeError(
             f"another job ({active}) is already running in {cwd_p}; "
@@ -505,6 +651,7 @@ def start_run(task_file: str, cwd: str, budget_usd: float | int | str | None = N
 
     pre_run_git = _pre_run_git_snapshot(cwd_p, job_id, run_dir)
 
+    started_ts = time.time()
     pid = _spawn(cmd, cwd_p, run_dir, prompt, job_id)
 
     meta = {
@@ -517,23 +664,31 @@ def start_run(task_file: str, cwd: str, budget_usd: float | int | str | None = N
         "cmd": cmd,
         "prompt": prompt,
         "started_at": _now_iso(),
-        "started_ts": time.time(),
+        "started_ts": started_ts,
         "pid": pid,
         "task_file_size_before": len(pre_bytes),
         "task_file_sha256_before": _sha256(pre_bytes),
         "budget_usd": budget_str,
+        "timeout_s": timeout_val,
+        "deadline_ts": started_ts + timeout_val,
         "pre_run_git": pre_run_git,
     }
     _save_meta(run_dir / "meta.json", meta)
-    return job_id
+    return {"job_id": job_id, "reaped": reaped}
 
 
 def start_ask(
     prev_job_id: str,
     prompt: str,
     budget_usd: float | int | str | None = None,
-) -> str:
-    """Resume an existing CC session with a follow-up prompt. Returns new job_id."""
+    timeout_s: float | int | str | None = None,
+) -> dict:
+    """Resume an existing CC session with a follow-up prompt.
+
+    Returns {"job_id": <new_id>, "reaped": [...]}. Timeout inherits
+    from the prior job when not specified, falling back to the default
+    for pre-timeout jobs — same shape as budget inheritance.
+    """
     _, prev_meta = _load_meta(prev_job_id)
     cwd_p = Path(prev_meta["cwd"])
     session_id = prev_meta["session_id"]
@@ -546,11 +701,16 @@ def start_ask(
         budget_str = _validate_budget(inherited) if inherited is not None else MAX_BUDGET_USD
     else:
         budget_str = _validate_budget(budget_usd)
+    if timeout_s is None:
+        inherited_t = prev_meta.get("timeout_s")
+        timeout_val = _validate_timeout(inherited_t) if inherited_t is not None else float(DEFAULT_JOB_TIMEOUT_S)
+    else:
+        timeout_val = _validate_timeout(timeout_s)
 
     if not cwd_p.is_dir():
         raise BridgeError(f"prior cwd no longer exists: {cwd_p}")
 
-    active = _active_in_cwd(cwd_p)
+    active, reaped = _active_in_cwd(cwd_p)
     if active:
         raise BridgeError(
             f"another job ({active}) is already running in {cwd_p}; "
@@ -573,6 +733,7 @@ def start_ask(
 
     pre_run_git = _pre_run_git_snapshot(cwd_p, job_id, run_dir)
 
+    started_ts = time.time()
     pid = _spawn(cmd, cwd_p, run_dir, prompt, job_id)
 
     meta = {
@@ -586,15 +747,87 @@ def start_ask(
         "cmd": cmd,
         "prompt": prompt,
         "started_at": _now_iso(),
-        "started_ts": time.time(),
+        "started_ts": started_ts,
         "pid": pid,
         "task_file_size_before": len(pre_bytes),
         "task_file_sha256_before": _sha256(pre_bytes),
         "budget_usd": budget_str,
+        "timeout_s": timeout_val,
+        "deadline_ts": started_ts + timeout_val,
         "pre_run_git": pre_run_git,
     }
     _save_meta(run_dir / "meta.json", meta)
-    return job_id
+    return {"job_id": job_id, "reaped": reaped}
+
+
+def kill_job(job_id: str) -> dict:
+    """Stop a running job on purpose. Only kills the pid recorded in meta.
+
+    Behaviour (Part 1 of TASK_cc-kill-and-wall-clock-timeout.md):
+
+      1. Already-ended job → return unchanged, describe what ended it.
+      2. Recorded pid not alive → let `_finalize_if_dead` catch up and
+         return the resulting state.
+      3. Otherwise SIGTERM the process group, wait `_KILL_GRACE_S`,
+         SIGKILL if still there. Write `ended_at`, `ended_reason:
+         "killed"`, and which signal actually ended it into meta.
+
+    Never accepts a pid, name or pattern from the caller — the pid
+    comes from the job's meta.json and nowhere else. `pkill -f` is
+    what a human does in an emergency; a tool that can do it would
+    also be able to kill an unrelated Claude Code session Chris is
+    using at his own keyboard.
+    """
+    meta_path, meta = _load_meta(job_id)
+
+    if meta.get("ended_at"):
+        return {
+            "job_id": job_id,
+            "already_ended": True,
+            "ended_at": meta["ended_at"],
+            "ended_reason": meta.get("ended_reason", "finished"),
+            "pid": meta.get("pid"),
+        }
+
+    pid = meta.get("pid")
+    if not pid:
+        raise BridgeError(f"job {job_id} has no recorded pid")
+
+    cwd = Path(meta["cwd"])
+
+    if not _pid_alive(pid):
+        # Wrapper is already gone (or was cleaned up out from under us).
+        # Let _finalize_if_dead put ended_at on it, then say so.
+        meta = _finalize_if_dead(meta_path, meta)
+        return {
+            "job_id": job_id,
+            "pid": pid,
+            "already_dead": True,
+            "ended_at": meta.get("ended_at"),
+            "ended_reason": meta.get("ended_reason", "finished"),
+            "cwd_free": _active_in_cwd(cwd)[0] is None,
+        }
+
+    sig_used = _terminate_pid(pid)
+    _reap_popen(job_id)
+
+    meta["ended_at"] = _now_iso()
+    meta["ended_ts"] = time.time()
+    meta["ended_reason"] = "killed"
+    meta["killed_signal"] = sig_used
+    meta.setdefault("exit_code", "killed")
+    _save_meta(meta_path, meta)
+
+    cwd_free = _active_in_cwd(cwd)[0] is None
+
+    return {
+        "job_id": job_id,
+        "pid": pid,
+        "signal": sig_used,
+        "ended_at": meta["ended_at"],
+        "ended_reason": "killed",
+        "cwd_free": cwd_free,
+    }
 
 
 def load_job(job_id: str) -> JobView:
