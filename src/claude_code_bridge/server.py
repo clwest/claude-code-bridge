@@ -38,6 +38,7 @@ from .runner import (
     load_job,
     push_branch,
     start_ask,
+    start_codex_run,
     start_run,
     tail,
     wait_for_job,
@@ -111,12 +112,14 @@ server: MCPServer = MCPServer(
     name="claude-code-bridge",
     version=__version__,
     instructions=(
-        "Drive a headless Claude Code session on a TASK_*.md file. Every "
-        "run has a fixed allow/deny tool list (see README) and a per-run "
-        "cost cap. Follow-ups on the same session use cc_ask. The bridge "
-        "does not fix the task file — it reports what CC did and whether "
-        "the report contract (dated report section, ask-list checklist, "
-        "status update) was met."
+        "Use cc_run and cc_ask for headless Claude Code sessions on "
+        "TASK_*.md files. Claude runs have a fixed allow/deny tool list "
+        "and per-run cost cap; follow-ups resume the same session. The "
+        "bridge reports whether the task-file contract was met. The "
+        "separate codex_run and codex_ask tools opt into read-only Codex "
+        "analysis; Codex does not have a per-run dollar cap or the Claude "
+        "named tool policy. Shared status, wait, result, kill, and list "
+        "tools accept jobs from either backend."
     ),
 )
 
@@ -142,6 +145,8 @@ def _state_for(view) -> str:
         return "killed"
     if reason == "timeout":
         return "timeout"
+    if reason == "failed" or m.get("backend_error") or m.get("backend_turn_failed"):
+        return "failed"
     if m.get("exit_code") == "unknown":
         return "finished (exit unknown)"
     return "finished"
@@ -165,10 +170,11 @@ def _format_reaped(reaped: list[dict]) -> str:
 
 def _format_job_line(view) -> str:
     m = view.meta
+    session_ref = m.get("session_ref", m.get("session_id", "-")) or "pending"
     return (
         f"{view.job_id}  [{_state_for(view)}]  cwd={m['cwd']}  "
         f"task={m.get('task_file_rel', m.get('task_file', '-'))}  "
-        f"session={m['session_id']}  kind={m.get('kind', 'run')}"
+        f"session={session_ref}  kind={m.get('kind', 'run')}"
     )
 
 
@@ -205,9 +211,45 @@ def cc_run(
 
 
 @server.tool(
+    name="codex_run",
+    description=(
+        "Start an opt-in Codex CLI analysis of a TASK_*.md file. This "
+        "initial backend is read-only: it cannot edit the task or project. "
+        "The cwd must be under ~/Donkey_Betz/ and inside a Codex-trusted "
+        "Git repository; the bridge does not bypass that check. Codex has "
+        "no per-run dollar cap in this integration. Optional timeout_s, "
+        "model, and reasoning_effort are passed to the Codex CLI. Use the "
+        "shared cc_status, cc_wait, and cc_result tools with the returned job_id."
+    ),
+    structured_output=False,
+)
+def codex_run(
+    task_file: str,
+    cwd: str,
+    timeout_s: float | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    """Start a read-only Codex analysis run."""
+    try:
+        result = start_codex_run(
+            task_file,
+            cwd,
+            timeout_s=timeout_s,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        prefix = _format_reaped(result.get("reaped", []))
+        return f"{prefix}Started Codex job {result['job_id']} (read-only)"
+    except Exception as exc:
+        return _friendly_error(exc)
+
+
+@server.tool(
     name="cc_status",
     description=(
-        "Report on a job started with cc_run or cc_ask: running/finished "
+        "Report on a job started with cc_run, cc_ask, codex_run, or "
+        "codex_ask: running/finished "
         "(or 'finished (exit unknown)' if the wrapper died before writing "
         "the exit code), elapsed seconds, budget, and the last ~20 lines "
         "of stdout+stderr. Does not block. The numeric exit code is on "
@@ -228,12 +270,26 @@ def cc_status(job_id: str) -> str:
             f"state: {state}",
             f"elapsed: {elapsed(view):.1f}s",
             f"cwd: {m['cwd']}",
-            f"session_id: {m['session_id']}",
-            f"task_file: {m['task_file']}",
-            f"kind: {m.get('kind', 'run')}",
-            f"budget: ${m.get('budget_usd', '2.00')}",
-            f"timeout: {timeout_str}",
         ]
+        if m.get("backend", "claude") == "codex":
+            parts.extend([
+                f"session_ref: {m.get('session_ref') or 'pending'}",
+                f"task_file: {m['task_file']}",
+                f"kind: {m.get('kind', 'run')}",
+                "budget: unsupported (Codex CLI has no per-run dollar cap)",
+                f"timeout: {timeout_str}",
+            ])
+            if m.get("usage"):
+                parts.append(f"usage: {m['usage']}")
+        else:
+            # Preserve the established Claude status fields and wording.
+            parts.extend([
+                f"session_id: {m['session_id']}",
+                f"task_file: {m['task_file']}",
+                f"kind: {m.get('kind', 'run')}",
+                f"budget: ${m.get('budget_usd', '2.00')}",
+                f"timeout: {timeout_str}",
+            ])
         if m.get("ended_at"):
             parts.append(f"ended_at: {m['ended_at']}")
             reason = m.get("ended_reason")
@@ -246,7 +302,7 @@ def cc_status(job_id: str) -> str:
         pre_line = _status_pre_run_line(m.get("pre_run_git"))
         if pre_line:
             parts.append(pre_line)
-        if cap_hit(view):
+        if m.get("backend", "claude") != "codex" and cap_hit(view):
             parts.append(_CAP_LINE)
         stdout_tail = tail(view.stdout_path)
         stderr_tail = tail(view.stderr_path)
@@ -283,8 +339,8 @@ def cc_result(job_id: str) -> str:
         result = contract_check(task_file, pre_text)
         stdout_text = view.stdout_path.read_text(errors="replace") if view.stdout_path.is_file() else ""
         stderr_text = view.stderr_path.read_text(errors="replace") if view.stderr_path.is_file() else ""
-        cap = cap_hit(view)
         m = view.meta
+        cap = m.get("backend", "claude") != "codex" and cap_hit(view)
         reason = m.get("ended_reason", "finished")
         reason_line = ""
         if reason != "finished":
@@ -299,14 +355,36 @@ def cc_result(job_id: str) -> str:
             + (f"{_CAP_LINE}\n" if cap else "")
             + reason_line
             + result.render()
-            + f"session_id: {m['session_id']}\n"
-            + f"exit_code: {m.get('exit_code', 'unknown')}  "
-            + f"budget: ${m.get('budget_usd', '2.00')}\n"
-            + f"cwd: {m['cwd']}\n"
-            + f"elapsed: {elapsed(view):.1f}s\n"
-            + _recovery_block(m.get("pre_run_git")) + "\n"
         )
-        body = "\n--- CC OUTPUT ---\n" + (stdout_text or "(empty)")
+        if m.get("backend", "claude") == "codex":
+            usage_line = f"usage: {m['usage']}\n" if m.get("usage") else ""
+            header += (
+                f"session_ref: {m.get('session_ref') or 'unavailable'}\n"
+                f"exit_code: {m.get('exit_code', 'unknown')}\n"
+                "budget: unsupported (Codex CLI has no per-run dollar cap)\n"
+                + usage_line
+                + f"cwd: {m['cwd']}\n"
+                + f"elapsed: {elapsed(view):.1f}s\n"
+                + _recovery_block(m.get("pre_run_git")) + "\n"
+            )
+            last_message = view.run_dir / "last_message.txt"
+            codex_output = (
+                last_message.read_text(errors="replace")
+                if last_message.is_file()
+                else stdout_text
+            )
+            body = "\n--- CODEX OUTPUT ---\n" + (codex_output or "(empty)")
+        else:
+            # Keep the Claude result text exactly as before the backend seam.
+            header += (
+                f"session_id: {m['session_id']}\n"
+                f"exit_code: {m.get('exit_code', 'unknown')}  "
+                f"budget: ${m.get('budget_usd', '2.00')}\n"
+                f"cwd: {m['cwd']}\n"
+                f"elapsed: {elapsed(view):.1f}s\n"
+                + _recovery_block(m.get("pre_run_git")) + "\n"
+            )
+            body = "\n--- CC OUTPUT ---\n" + (stdout_text or "(empty)")
         if stderr_text.strip():
             body += "\n\n--- CC STDERR ---\n" + stderr_text
         return header + body
@@ -367,6 +445,30 @@ def cc_ask(
         result = start_ask(job_id, prompt, budget_usd=budget_usd, timeout_s=timeout_s)
         prefix = _format_reaped(result.get("reaped", []))
         return f"{prefix}Started follow-up job {result['job_id']}"
+    except Exception as exc:
+        return _friendly_error(exc)
+
+
+@server.tool(
+    name="codex_ask",
+    description=(
+        "Continue a completed Codex job using its persisted thread ID. "
+        "The Codex session remains read-only. There is no per-run dollar "
+        "budget option. Use the shared cc_status, cc_wait, and cc_result "
+        "tools with the returned job_id."
+    ),
+    structured_output=False,
+)
+def codex_ask(
+    job_id: str,
+    prompt: str,
+    timeout_s: float | None = None,
+) -> str:
+    """Continue a Codex session; start_ask dispatches by stored backend."""
+    try:
+        result = start_ask(job_id, prompt, timeout_s=timeout_s)
+        prefix = _format_reaped(result.get("reaped", []))
+        return f"{prefix}Started Codex follow-up job {result['job_id']}"
     except Exception as exc:
         return _friendly_error(exc)
 

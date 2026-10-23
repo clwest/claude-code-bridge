@@ -28,14 +28,12 @@ from pathlib import Path
 
 import re
 
+from .backends import CodexBackend, get_backend
 from .config import (
-    ALLOWED_TOOLS,
     DEFAULT_JOB_TIMEOUT_S,
-    DISALLOWED_TOOLS,
     MAX_BUDGET_CEILING_USD,
     MAX_BUDGET_USD,
     MAX_JOB_TIMEOUT_S,
-    PERMISSION_MODE,
     RUNS_DIR,
     WORKSPACE_ROOT,
 )
@@ -389,25 +387,11 @@ def _cc_command(session_id: str, resume: bool, budget_usd: str) -> list[str]:
     argument" because "prompt" is grabbed as another disallowed tool.
     Stdin sidesteps the issue entirely.
     """
-    cmd = [
-        "claude",
-        "--print",
-        "--output-format",
-        "text",
-        "--permission-mode",
-        PERMISSION_MODE,
-        "--max-budget-usd",
-        budget_usd,
-        "--allowedTools",
-        " ".join(ALLOWED_TOOLS),
-        "--disallowedTools",
-        " ".join(DISALLOWED_TOOLS),
-    ]
+    backend = get_backend("claude")
+    output_path = Path()  # Claude writes its response to stdout as before.
     if resume:
-        cmd += ["-r", session_id]
-    else:
-        cmd += ["--session-id", session_id]
-    return cmd
+        return backend.resume_command(session_id, output_path, budget_usd=budget_usd)
+    return backend.start_command(session_id, output_path, budget_usd=budget_usd)
 
 
 def _iter_jobs() -> list[Path]:
@@ -442,6 +426,42 @@ def _reap_popen(job_id: str) -> int | None:
     if code is not None:
         _LIVE_POPENS.pop(job_id, None)
     return code
+
+
+def _finalize_backend_output(meta_path: Path, meta: dict) -> None:
+    """Persist backend-specific result fields after its process exits."""
+    backend_name = meta.get("backend", "claude")
+    if backend_name != "codex":
+        return
+
+    stdout_path = meta_path.parent / "stdout.log"
+    stdout = stdout_path.read_text(errors="replace") if stdout_path.is_file() else ""
+    expected_ref = meta.get("session_ref") if meta.get("kind") == "ask" else None
+    output = CodexBackend.parse_output(stdout, expected_session_ref=expected_ref)
+    if output.session_ref:
+        meta["session_ref_observed"] = output.session_ref
+        if meta.get("session_ref") is None:
+            meta["session_ref"] = output.session_ref
+    if output.usage is not None:
+        meta["usage"] = output.usage
+    if output.turn_failed:
+        meta["backend_turn_failed"] = output.turn_failed
+    if output.parse_errors:
+        meta["backend_jsonl_parse_errors"] = output.parse_errors
+    if output.session_ref_mismatch:
+        if meta.get("kind") == "ask":
+            meta["backend_error"] = "Codex resume returned a different or missing thread ID"
+        else:
+            meta["backend_error"] = "Codex emitted inconsistent thread IDs"
+    elif meta.get("kind") == "run" and not output.session_ref and meta.get("exit_code") == 0:
+        meta["backend_error"] = "Codex did not emit a thread.started session reference"
+    elif isinstance(meta.get("exit_code"), int) and meta["exit_code"] != 0:
+        meta["backend_error"] = f"Codex exited with status {meta['exit_code']}"
+
+    if (meta.get("backend_error") or meta.get("backend_turn_failed")) and meta.get("ended_reason") not in {
+        "killed", "timeout"
+    }:
+        meta["ended_reason"] = "failed"
 
 
 def _finalize_if_dead(meta_path: Path, meta: dict) -> dict:
@@ -515,6 +535,7 @@ def _finalize_if_dead(meta_path: Path, meta: dict) -> dict:
     meta["ended_ts"] = time.time()
     meta["exit_code"] = exit_code
     meta.setdefault("ended_reason", ended_reason)
+    _finalize_backend_output(meta_path, meta)
     _save_meta(meta_path, meta)
     return meta
 
@@ -633,7 +654,41 @@ def start_run(
     budget_usd: float | int | str | None = None,
     timeout_s: float | int | str | None = None,
 ) -> dict:
-    """Start a fresh headless CC run.
+    """Start a fresh headless Claude Code run (legacy public entry point)."""
+    return _start_backend_run(
+        task_file, cwd, backend_name="claude", budget_usd=budget_usd, timeout_s=timeout_s
+    )
+
+
+def start_codex_run(
+    task_file: str,
+    cwd: str,
+    timeout_s: float | int | str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict:
+    """Start an opt-in, read-only Codex analysis run on a task file."""
+    return _start_backend_run(
+        task_file,
+        cwd,
+        backend_name="codex",
+        timeout_s=timeout_s,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def _start_backend_run(
+    task_file: str,
+    cwd: str,
+    *,
+    backend_name: str,
+    budget_usd: float | int | str | None = None,
+    timeout_s: float | int | str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict:
+    """Perform shared validation/setup, then delegate invocation to a backend.
 
     Returns a dict: {"job_id": <id>, "reaped": [{"job_id": ..., "reason": ...}, ...]}.
     The `reaped` list names any stale jobs finalized on this call —
@@ -643,7 +698,13 @@ def start_run(
     """
     cwd_p = _validate_cwd(cwd)
     tf = _validate_task_file(task_file, cwd_p)
-    budget_str = _validate_budget(budget_usd)
+    backend = get_backend(backend_name)
+    if backend_name == "claude":
+        budget_str = _validate_budget(budget_usd)
+    else:
+        if budget_usd is not None:
+            raise BridgeError("Codex does not support a per-run dollar budget")
+        budget_str = None
     timeout_val = _validate_timeout(timeout_s)
 
     active, reaped = _active_in_cwd(cwd_p)
@@ -658,25 +719,35 @@ def start_run(
     run_dir = RUNS_DIR / job_id
     run_dir.mkdir()
 
-    session_id = str(uuid.uuid4())
+    session_ref = str(uuid.uuid4()) if backend_name == "claude" else None
     task_rel = tf.relative_to(cwd_p)
-    # The prompt tells CC to DO the work, not consider it. Written this way
-    # because on 2026-09-02 a bare "Read <file>" prompt made a real headless
-    # run stop to ask whether it should proceed — with nobody on the other
-    # end of --print to answer. Do not "simplify" this back to `Read X`:
-    # a --print session that asks a question is a dead run that still costs
-    # money. `start_ask` passes the caller's prompt through unchanged (those
-    # come from Cowork and are already imperative).
-    prompt = (
-        f"Read {task_rel} and do the work in it now. This is a headless "
-        "session — there is no one to answer questions, so do not stop to "
-        "ask for confirmation. If you hit a decision you cannot make, "
-        "write the options, the costs and your recommendation into the "
-        "task file, then keep going with everything that is not blocked "
-        "by it. Finish by appending the dated report section and the "
-        "ask-list checklist and updating the frontmatter status."
+    if backend_name == "claude":
+        # Preserve the established Claude prompt verbatim: its headless
+        # contract requires work and an appended report.
+        prompt = (
+            f"Read {task_rel} and do the work in it now. This is a headless "
+            "session — there is no one to answer questions, so do not stop to "
+            "ask for confirmation. If you hit a decision you cannot make, "
+            "write the options, the costs and your recommendation into the "
+            "task file, then keep going with everything that is not blocked "
+            "by it. Finish by appending the dated report section and the "
+            "ask-list checklist and updating the frontmatter status."
+        )
+    else:
+        prompt = (
+            f"Read {task_rel} and analyze the work requested. This Codex "
+            "backend is intentionally read-only: do not attempt edits, "
+            "commits, or other file changes. Return your analysis and the "
+            "work that would be needed in your final response; do not claim "
+            "that the task file was updated."
+        )
+    cmd = backend.start_command(
+        session_ref,
+        RUNS_DIR / job_id / "last_message.txt",
+        budget_usd=budget_str,
+        model=model,
+        reasoning_effort=reasoning_effort,
     )
-    cmd = _cc_command(session_id, resume=False, budget_usd=budget_str)
 
     pre_bytes = tf.read_bytes()
     (run_dir / "pre.txt").write_bytes(pre_bytes)
@@ -689,10 +760,11 @@ def start_run(
     meta = {
         "job_id": job_id,
         "kind": "run",
+        "backend": backend_name,
         "cwd": str(cwd_p),
         "task_file": str(tf),
         "task_file_rel": str(task_rel),
-        "session_id": session_id,
+        "session_ref": session_ref,
         "cmd": cmd,
         "prompt": prompt,
         "started_at": _now_iso(),
@@ -700,11 +772,18 @@ def start_run(
         "pid": pid,
         "task_file_size_before": len(pre_bytes),
         "task_file_sha256_before": _sha256(pre_bytes),
-        "budget_usd": budget_str,
         "timeout_s": timeout_val,
         "deadline_ts": started_ts + timeout_val,
         "pre_run_git": pre_run_git,
     }
+    if backend_name == "claude":
+        # Retain the legacy field consumed by existing job readers.
+        meta["session_id"] = session_ref
+        meta["budget_usd"] = budget_str
+    if model:
+        meta["model"] = model
+    if reasoning_effort:
+        meta["reasoning_effort"] = reasoning_effort
     _save_meta(run_dir / "meta.json", meta)
     return {"job_id": job_id, "reaped": reaped}
 
@@ -722,6 +801,11 @@ def start_ask(
     for pre-timeout jobs — same shape as budget inheritance.
     """
     _, prev_meta = _load_meta(prev_job_id)
+    if prev_meta.get("backend", "claude") == "codex":
+        if budget_usd is not None:
+            raise BridgeError("Codex does not support a per-run dollar budget")
+        return _start_codex_ask(prev_job_id, prompt, timeout_s=timeout_s)
+
     cwd_p = Path(prev_meta["cwd"])
     session_id = prev_meta["session_id"]
     task_file = Path(prev_meta["task_file"])
@@ -771,11 +855,13 @@ def start_ask(
     meta = {
         "job_id": job_id,
         "kind": "ask",
+        "backend": "claude",
         "prev_job_id": prev_job_id,
         "cwd": str(cwd_p),
         "task_file": str(task_file),
         "task_file_rel": task_rel,
         "session_id": session_id,
+        "session_ref": session_id,
         "cmd": cmd,
         "prompt": prompt,
         "started_at": _now_iso(),
@@ -788,6 +874,90 @@ def start_ask(
         "deadline_ts": started_ts + timeout_val,
         "pre_run_git": pre_run_git,
     }
+    _save_meta(run_dir / "meta.json", meta)
+    return {"job_id": job_id, "reaped": reaped}
+
+
+def _start_codex_ask(
+    prev_job_id: str,
+    prompt: str,
+    timeout_s: float | int | str | None = None,
+) -> dict:
+    """Resume a completed Codex session, preserving its stored thread ID."""
+    if not prompt or not prompt.strip():
+        raise BridgeError("prompt must be non-empty for codex_ask")
+
+    _, prev_meta = _load_meta(prev_job_id)
+    cwd_p = Path(prev_meta["cwd"])
+    if not cwd_p.is_dir():
+        raise BridgeError(f"prior cwd no longer exists: {cwd_p}")
+
+    active, reaped = _active_in_cwd(cwd_p)
+    if active:
+        raise BridgeError(
+            f"another job ({active}) is already running in {cwd_p}; "
+            "one run per cwd at a time"
+        )
+
+    # The previous process may have ended since the first read. The
+    # active-job scan finalizes it and extracts thread.started.thread_id.
+    _, prev_meta = _load_meta(prev_job_id)
+    session_ref = prev_meta.get("session_ref")
+    if not session_ref:
+        raise BridgeError(
+            f"Codex job {prev_job_id} has no persisted thread ID; cannot resume it"
+        )
+
+    if timeout_s is None:
+        inherited_timeout = prev_meta.get("timeout_s", DEFAULT_JOB_TIMEOUT_S)
+        timeout_val = _validate_timeout(inherited_timeout)
+    else:
+        timeout_val = _validate_timeout(timeout_s)
+
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = _new_job_id()
+    run_dir = RUNS_DIR / job_id
+    run_dir.mkdir()
+
+    backend = get_backend("codex")
+    cmd = backend.resume_command(
+        session_ref,
+        run_dir / "last_message.txt",
+        model=prev_meta.get("model"),
+        reasoning_effort=prev_meta.get("reasoning_effort"),
+    )
+    task_file = Path(prev_meta["task_file"])
+    task_rel = prev_meta.get("task_file_rel", str(task_file))
+    pre_bytes = task_file.read_bytes() if task_file.is_file() else b""
+    (run_dir / "pre.txt").write_bytes(pre_bytes)
+    pre_run_git = _pre_run_git_snapshot(cwd_p, job_id, run_dir)
+
+    started_ts = time.time()
+    pid = _spawn(cmd, cwd_p, run_dir, prompt, job_id)
+    meta = {
+        "job_id": job_id,
+        "kind": "ask",
+        "backend": "codex",
+        "prev_job_id": prev_job_id,
+        "cwd": str(cwd_p),
+        "task_file": str(task_file),
+        "task_file_rel": task_rel,
+        "session_ref": session_ref,
+        "cmd": cmd,
+        "prompt": prompt,
+        "started_at": _now_iso(),
+        "started_ts": started_ts,
+        "pid": pid,
+        "task_file_size_before": len(pre_bytes),
+        "task_file_sha256_before": _sha256(pre_bytes),
+        "timeout_s": timeout_val,
+        "deadline_ts": started_ts + timeout_val,
+        "pre_run_git": pre_run_git,
+    }
+    if prev_meta.get("model"):
+        meta["model"] = prev_meta["model"]
+    if prev_meta.get("reasoning_effort"):
+        meta["reasoning_effort"] = prev_meta["reasoning_effort"]
     _save_meta(run_dir / "meta.json", meta)
     return {"job_id": job_id, "reaped": reaped}
 
@@ -848,6 +1018,7 @@ def kill_job(job_id: str) -> dict:
     meta["ended_reason"] = "killed"
     meta["killed_signal"] = sig_used
     meta.setdefault("exit_code", "killed")
+    _finalize_backend_output(meta_path, meta)
     _save_meta(meta_path, meta)
 
     cwd_free = _active_in_cwd(cwd)[0] is None

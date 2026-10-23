@@ -13,7 +13,7 @@ reviewer still reads to the end. What goes away is the human relay.
 
 ## What it exposes
 
-Eight tools. That's the whole surface.
+Eight Claude tools. The opt-in Codex tools are described below.
 
 | Tool | What it does |
 |---|---|
@@ -25,6 +25,28 @@ Eight tools. That's the whole surface.
 | `cc_kill(job_id)` | Stop a running job on purpose. Only kills the pid recorded in that job's `meta.json` — never a pid, name or pattern from the caller. Sends SIGTERM, waits 5 seconds, sends SIGKILL if still alive. Records `ended_reason: killed` and which signal actually ended it, and says whether the cwd is free afterwards. On an already-ended job, says so and does nothing. |
 | `cc_list()` | Every job this bridge has started, with cwd and current state. |
 | `cc_push(cwd, remote="origin")` | Publish the current branch's commits from `cwd` on `remote`. The only sanctioned way through — `Bash(git push:*)` in the deny list stays as-is. Deliberately no argument passthrough: `--force`, `--force-with-lease`, `--delete`, `--tags` and refspecs are unreachable from outside this tool. Refuses a detached HEAD (names the SHA), reports a non-fast-forward with git's own reason on one line and says the branch was not published, treats "already up to date" as a normal result, and pushes with `--set-upstream` when no upstream is set (the return says a new remote branch was created). Returns branch, remote name and URL, remote SHA before and after, and how many commits were published. 120s wall clock. |
+
+## Opt-in Codex backend
+
+`codex_run(task_file, cwd, timeout_s=None, model=None, reasoning_effort=None)`
+and `codex_ask(job_id, prompt, timeout_s=None)` add a separate, opt-in
+Codex CLI path. Existing `cc_*` tools still start Claude Code by default
+and retain their Claude-specific tool policy and dollar cap.
+
+The initial Codex path is deliberately **read-only** (`codex exec --json
+--sandbox read-only`). It reads a `TASK_*.md` file and returns analysis;
+it cannot complete task-file edits. It requires Codex's normal repository
+trust check and does not skip it. Follow-ups resume the stored
+`thread.started.thread_id`; the bridge checks that a resumed process emits
+the same thread ID. The shared `cc_status`, `cc_wait`, `cc_result`,
+`cc_kill`, and `cc_list` tools can inspect Codex jobs as well.
+
+Codex stdout is retained as JSONL, stderr is retained separately, and its
+plain-text final response is stored via `--output-last-message`. Parsed
+`turn.completed` token usage is shown when available. This integration
+does not claim a per-run dollar cap or a named tool allow/deny policy for
+Codex. Codex write access is not enabled until its rules and approval
+behavior have been verified for this bridge.
 
 ## The contract check
 
