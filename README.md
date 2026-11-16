@@ -41,12 +41,48 @@ trust check and does not skip it. Follow-ups resume the stored
 the same thread ID. The shared `cc_status`, `cc_wait`, `cc_result`,
 `cc_kill`, and `cc_list` tools can inspect Codex jobs as well.
 
+For explicitly requested implementation work, `codex_write_run(...)` and
+`codex_write_ask(...)` provide a separate workspace-write path. They use
+Codex's `workspace-write` sandbox and `--approve-for-me` review; the current
+project directory is the writable boundary, and network access remains
+restricted by the sandbox. The MCP client is also configured to prompt for
+approval before invoking these write tools. This path still has no per-run
+dollar cap, and Codex has no Claude-style named tool allow/deny policy.
+Write tools must only be used when the user has explicitly asked for file
+changes. They do not grant unrestricted filesystem access or add a path for
+publishing commits. The read-only `codex_run` / `codex_ask` tools remain
+available for analysis.
+
+The default write-task prompt requires reading the task file, applicable
+repository guidance (`AGENTS.md` and `CLAUDE.md` when present), and relevant
+existing documentation before editing. When a project includes context-kit or
+its docs designate context-kit as the continuity system, follow its existing
+handoff, inventory, and verification workflow where applicable to preserve
+persistent, trustworthy project continuity. Do not invent a parallel documentation
+system. For projects without context-kit, use their existing canonical docs.
+
+Documentation is part of completing
+implementation work: changes affecting user-visible behavior, setup/configuration,
+interfaces, architecture, or workflows must update the existing canonical
+documentation in the same task. Maintain existing docs in preference to
+creating duplicates; if no product-documentation change is warranted, explain
+why in the task report instead of adding a needless document.
+
+Keep the `TASK_*.md` report as a concise execution record, not a replacement
+for context-kit's handoff. When complete, set the task file's
+frontmatter `status` to `done` and append `## Report — YYYY-MM-DD` with a
+checked checklist item for every request, files changed, documentation updated
+(or why none was needed), and checks run or not run. Never claim checks that
+were not performed. Keep changes within the requested scope and project
+directory; do not commit, push, or publish unless the task explicitly asks.
+If blocked, explain the blocker instead of bypassing it.
+
 Codex stdout is retained as JSONL, stderr is retained separately, and its
 plain-text final response is stored via `--output-last-message`. Parsed
 `turn.completed` token usage is shown when available. This integration
 does not claim a per-run dollar cap or a named tool allow/deny policy for
-Codex. Codex write access is not enabled until its rules and approval
-behavior have been verified for this bridge.
+Codex. Both modes preserve the normal Git repository trust check and do not
+skip user or project execpolicy rules.
 
 ## The contract check
 

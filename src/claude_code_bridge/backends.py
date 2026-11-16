@@ -105,9 +105,11 @@ class ClaudeBackend:
 
 
 class CodexBackend:
-    """Opt-in Codex adapter. It is explicitly read-only until policy is verified."""
+    """Codex adapter; the default instance remains explicitly read-only."""
 
     name = "codex"
+    sandbox_mode = "read-only"
+    approve_for_me = False
     # These levels were present across the bundled models inspected for
     # this CLI version; higher levels are not available on every model.
     _REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
@@ -154,17 +156,23 @@ class CodexBackend:
         if reasoning_effort is not None and reasoning_effort not in cls._REASONING_EFFORTS:
             raise ValueError(f"unsupported Codex reasoning effort: {reasoning_effort}")
         cmd = ["codex", "exec"]
+        if cls.approve_for_me:
+            # Keep this before the `resume` subcommand; the installed CLI
+            # accepts it as an exec-level option for both new and resumed runs.
+            cmd.append("--approve-for-me")
         if resume_ref is not None:
             cmd += [
                 "resume",
                 "--json",
                 "--ignore-user-config",
-                "-c",
-                'sandbox_mode="read-only"',
-                resume_ref,
             ]
+            if not cls.approve_for_me:
+                cmd += ["-c", f'sandbox_mode="{cls.sandbox_mode}"']
+            cmd.append(resume_ref)
         else:
-            cmd += ["--ignore-user-config", "--json", "--sandbox", "read-only"]
+            cmd += ["--ignore-user-config", "--json"]
+            if not cls.approve_for_me:
+                cmd += ["--sandbox", cls.sandbox_mode]
         if model:
             cmd += ["--model", model]
         if reasoning_effort:
@@ -218,10 +226,25 @@ class CodexBackend:
         )
 
 
+class CodexWriteBackend(CodexBackend):
+    """Workspace-write Codex adapter with Codex's automatic approval review."""
+
+    name = "codex-write"
+    sandbox_mode = "workspace-write"
+    approve_for_me = True
+
+
 _BACKENDS: dict[str, ExecutionBackend] = {
     "claude": ClaudeBackend(),
     "codex": CodexBackend(),
+    "codex-write": CodexWriteBackend(),
 }
+
+CODEX_BACKENDS = frozenset({"codex", "codex-write"})
+
+
+def is_codex_backend(name: str | None) -> bool:
+    return name in CODEX_BACKENDS
 
 
 def get_backend(name: str | None) -> ExecutionBackend:

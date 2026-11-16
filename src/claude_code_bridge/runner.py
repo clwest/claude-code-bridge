@@ -28,7 +28,7 @@ from pathlib import Path
 
 import re
 
-from .backends import CodexBackend, get_backend
+from .backends import CodexBackend, get_backend, is_codex_backend
 from .config import (
     DEFAULT_JOB_TIMEOUT_S,
     MAX_BUDGET_CEILING_USD,
@@ -431,7 +431,7 @@ def _reap_popen(job_id: str) -> int | None:
 def _finalize_backend_output(meta_path: Path, meta: dict) -> None:
     """Persist backend-specific result fields after its process exits."""
     backend_name = meta.get("backend", "claude")
-    if backend_name != "codex":
+    if not is_codex_backend(backend_name):
         return
 
     stdout_path = meta_path.parent / "stdout.log"
@@ -678,6 +678,24 @@ def start_codex_run(
     )
 
 
+def start_codex_write_run(
+    task_file: str,
+    cwd: str,
+    timeout_s: float | int | str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict:
+    """Start an explicitly requested Codex run with workspace-write access."""
+    return _start_backend_run(
+        task_file,
+        cwd,
+        backend_name="codex-write",
+        timeout_s=timeout_s,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+
 def _start_backend_run(
     task_file: str,
     cwd: str,
@@ -733,13 +751,45 @@ def _start_backend_run(
             "by it. Finish by appending the dated report section and the "
             "ask-list checklist and updating the frontmatter status."
         )
-    else:
+    elif backend_name == "codex":
         prompt = (
             f"Read {task_rel} and analyze the work requested. This Codex "
             "backend is intentionally read-only: do not attempt edits, "
             "commits, or other file changes. Return your analysis and the "
             "work that would be needed in your final response; do not claim "
             "that the task file was updated."
+        )
+    else:
+        prompt = (
+            f"Read {task_rel} and carry out the requested work. This Codex "
+            "session has workspace-write access only within the current "
+            "project directory. Keep changes within the requested scope. "
+            "Do not commit, push, or publish changes unless the task "
+            "explicitly asks for that. If blocked, explain the blocker "
+            "instead of trying to bypass it. Before editing, read the task "
+            "file, applicable repository guidance (AGENTS.md and CLAUDE.md "
+            "when present), and relevant existing documentation. When the "
+            "project includes context-kit or its docs designate context-kit "
+            "as the continuity system, follow its existing handoff, inventory, "
+            "and verification workflow where applicable to preserve persistent, "
+            "trustworthy project continuity. Do not invent a parallel "
+            "documentation system. For projects without context-kit, use "
+            "their existing canonical docs. Treat "
+            "documentation as part of completing implementation work: when "
+            "a change affects user-visible behavior, setup/configuration, "
+            "interfaces, architecture, or workflows, update the existing "
+            "canonical documentation in the same task. Prefer maintaining "
+            "existing docs over creating duplicates. If no product-documentation "
+            "change is warranted, explain why in the task report instead of "
+            "adding a needless document. Keep the TASK_*.md report as a "
+            "concise execution record, not a replacement for context-kit's "
+            "handoff: when complete, set its frontmatter status "
+            "to done and append a dated ## Report — YYYY-MM-DD section with "
+            "a checked checklist item for every request, files changed, "
+            "documentation updated (or why none was needed), and checks run "
+            "or not run. Do not claim checks that were not performed. "
+            "Finish with a concise summary "
+            "of files changed and checks performed."
         )
     cmd = backend.start_command(
         session_ref,
@@ -801,7 +851,7 @@ def start_ask(
     for pre-timeout jobs — same shape as budget inheritance.
     """
     _, prev_meta = _load_meta(prev_job_id)
-    if prev_meta.get("backend", "claude") == "codex":
+    if is_codex_backend(prev_meta.get("backend", "claude")):
         if budget_usd is not None:
             raise BridgeError("Codex does not support a per-run dollar budget")
         return _start_codex_ask(prev_job_id, prompt, timeout_s=timeout_s)
@@ -919,7 +969,8 @@ def _start_codex_ask(
     run_dir = RUNS_DIR / job_id
     run_dir.mkdir()
 
-    backend = get_backend("codex")
+    backend_name = prev_meta.get("backend", "codex")
+    backend = get_backend(backend_name)
     cmd = backend.resume_command(
         session_ref,
         run_dir / "last_message.txt",
@@ -937,7 +988,7 @@ def _start_codex_ask(
     meta = {
         "job_id": job_id,
         "kind": "ask",
-        "backend": "codex",
+        "backend": backend_name,
         "prev_job_id": prev_job_id,
         "cwd": str(cwd_p),
         "task_file": str(task_file),
@@ -960,6 +1011,30 @@ def _start_codex_ask(
         meta["reasoning_effort"] = prev_meta["reasoning_effort"]
     _save_meta(run_dir / "meta.json", meta)
     return {"job_id": job_id, "reaped": reaped}
+
+
+def start_codex_ask(
+    prev_job_id: str,
+    prompt: str,
+    timeout_s: float | int | str | None = None,
+) -> dict:
+    """Continue only a read-only Codex job."""
+    _, meta = _load_meta(prev_job_id)
+    if meta.get("backend") != "codex":
+        raise BridgeError("codex_ask can only continue a read-only Codex job")
+    return _start_codex_ask(prev_job_id, prompt, timeout_s=timeout_s)
+
+
+def start_codex_write_ask(
+    prev_job_id: str,
+    prompt: str,
+    timeout_s: float | int | str | None = None,
+) -> dict:
+    """Continue only a workspace-write Codex job."""
+    _, meta = _load_meta(prev_job_id)
+    if meta.get("backend") != "codex-write":
+        raise BridgeError("codex_write_ask can only continue a workspace-write Codex job")
+    return _start_codex_ask(prev_job_id, prompt, timeout_s=timeout_s)
 
 
 def kill_job(job_id: str) -> dict:
