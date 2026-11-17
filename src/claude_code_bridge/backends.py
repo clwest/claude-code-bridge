@@ -110,6 +110,7 @@ class CodexBackend:
     name = "codex"
     sandbox_mode = "read-only"
     approve_for_me = False
+    auto_review = False
     # These levels were present across the bundled models inspected for
     # this CLI version; higher levels are not available on every model.
     _REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
@@ -173,6 +174,13 @@ class CodexBackend:
             cmd += ["--ignore-user-config", "--json"]
             if not cls.approve_for_me:
                 cmd += ["--sandbox", cls.sandbox_mode]
+        if cls.auto_review:
+            # --approve-for-me selects workspace-write. Configure review
+            # separately so full access retains its filesystem/network mode.
+            cmd += [
+                "-c", 'approval_policy="on-request"',
+                "-c", 'approvals_reviewer="auto_review"',
+            ]
         if model:
             cmd += ["--model", model]
         if reasoning_effort:
@@ -234,13 +242,22 @@ class CodexWriteBackend(CodexBackend):
     approve_for_me = True
 
 
+class CodexFullAccessBackend(CodexBackend):
+    """Explicit opt-in: unrestricted filesystem/network, eligible approvals reviewed."""
+
+    name = "codex-full-access"
+    sandbox_mode = "danger-full-access"
+    auto_review = True
+
+
 _BACKENDS: dict[str, ExecutionBackend] = {
     "claude": ClaudeBackend(),
     "codex": CodexBackend(),
     "codex-write": CodexWriteBackend(),
+    "codex-full-access": CodexFullAccessBackend(),
 }
 
-CODEX_BACKENDS = frozenset({"codex", "codex-write"})
+CODEX_BACKENDS = frozenset({"codex", "codex-write", "codex-full-access"})
 
 
 def is_codex_backend(name: str | None) -> bool:

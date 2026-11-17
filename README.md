@@ -24,7 +24,7 @@ Eight Claude tools. The opt-in Codex tools are described below.
 | `cc_ask(job_id, prompt, budget_usd=None, timeout_s=None)` | A follow-up question **into the same CC session** (resumed by `session_id`). Optional `budget_usd` overrides the inherited budget from the prior job (default $2.00, ceiling $50.00). Optional `timeout_s` overrides the inherited wall-clock ceiling (default 45 min, ceiling 8 h). Returns a new `job_id`. Use this to say "you skipped the ask list, please add it." |
 | `cc_kill(job_id)` | Stop a running job on purpose. Only kills the pid recorded in that job's `meta.json` — never a pid, name or pattern from the caller. Sends SIGTERM, waits 5 seconds, sends SIGKILL if still alive. Records `ended_reason: killed` and which signal actually ended it, and says whether the cwd is free afterwards. On an already-ended job, says so and does nothing. |
 | `cc_list()` | Every job this bridge has started, with cwd and current state. |
-| `cc_push(cwd, remote="origin")` | Publish the current branch's commits from `cwd` on `remote`. The only sanctioned way through — `Bash(git push:*)` in the deny list stays as-is. Deliberately no argument passthrough: `--force`, `--force-with-lease`, `--delete`, `--tags` and refspecs are unreachable from outside this tool. Refuses a detached HEAD (names the SHA), reports a non-fast-forward with git's own reason on one line and says the branch was not published, treats "already up to date" as a normal result, and pushes with `--set-upstream` when no upstream is set (the return says a new remote branch was created). Returns branch, remote name and URL, remote SHA before and after, and how many commits were published. 120s wall clock. |
+| `cc_push(cwd, remote="origin")` | Publish the current branch's commits from `cwd` on `remote`. The sanctioned publishing tool for Claude workflows — `Bash(git push:*)` in the Claude deny list stays as-is. Deliberately no argument passthrough: `--force`, `--force-with-lease`, `--delete`, `--tags` and refspecs are unreachable from outside this tool. Refuses a detached HEAD (names the SHA), reports a non-fast-forward with git's own reason on one line and says the branch was not published, treats "already up to date" as a normal result, and pushes with `--set-upstream` when no upstream is set (the return says a new remote branch was created). Returns branch, remote name and URL, remote SHA before and after, and how many commits were published. 120s wall clock. |
 
 ## Opt-in Codex backend
 
@@ -41,20 +41,61 @@ trust check and does not skip it. Follow-ups resume the stored
 the same thread ID. The shared `cc_status`, `cc_wait`, `cc_result`,
 `cc_kill`, and `cc_list` tools can inspect Codex jobs as well.
 
+The permission modes are separate tools; selecting a safer mode never
+silently grants full access:
+
+| Run / resume tools | Filesystem and network permissions |
+|---|---|
+| `codex_run(...)` / `codex_ask(...)` | `read-only` analysis; cannot edit the task or project. |
+| `codex_write_run(...)` / `codex_write_ask(...)` | `workspace-write` implementation with `--approve-for-me` automatic review; network access remains restricted. Git metadata and other protected paths can require approval. |
+| `codex_full_access_run(...)` / `codex_full_access_ask(...)` | Explicit opt-in `danger-full-access`; unrestricted filesystem and network access, including read/write outside `cwd`, Git metadata writes, local loopback test servers, and explicitly authorized pushes. |
+
 For explicitly requested implementation work, `codex_write_run(...)` and
-`codex_write_ask(...)` provide a separate workspace-write path. They use
-Codex's `workspace-write` sandbox and `--approve-for-me` review; the current
-project directory is the writable boundary, and network access remains
-restricted by the sandbox. The MCP client is also configured to prompt for
-approval before invoking these write tools. This path still has no per-run
+`codex_write_ask(...)` retain the existing workspace-write path. The MCP
+client is also configured to prompt for approval before invoking these write
+tools. This path still has no per-run
 dollar cap, and Codex has no Claude-style named tool allow/deny policy.
-Write tools must only be used when the user has explicitly asked for file
+Workspace-write tools must only be used when the user has explicitly asked for file
 changes. They do not grant unrestricted filesystem access or add a path for
 publishing commits. The read-only `codex_run` / `codex_ask` tools remain
 available for analysis.
 
-The default write-task prompt requires reading the task file, applicable
-repository guidance (`AGENTS.md` and `CLAUDE.md` when present), and relevant
+`codex_full_access_run(task_file, cwd, timeout_s=None, model=None,
+reasoning_effort=None)` starts a full-access job.
+`codex_full_access_ask(job_id, prompt, timeout_s=None)` resumes only a prior
+full-access job with the same stored thread ID and permission mode. It cannot
+upgrade a read-only or workspace-write job, and those modes' resume tools
+cannot continue a full-access job. `cc_ask` also refuses full-access jobs;
+use the explicitly named full-access resume tool.
+
+**Only call full-access tools for tasks the user explicitly authorized.**
+They permit reading and writing outside `cwd` and accessing the network.
+The resolved `cwd` must still be under `~/Donkey_Betz/`, and the existing
+`TASK_*.md` must still be under `cwd`. These repository restrictions are
+**input validation, not a sandbox boundary**. Keep work within the task's
+scope; commit, push, or publish only when the task explicitly asks. Selecting
+full access does not itself authorize any of those actions. The bridge checks
+the selected backend when resuming; user authorization is a caller obligation,
+not something the server can infer from the task text. Configure any desired
+MCP client approval prompts for these new tools separately; this repository
+does not configure client approvals for them.
+
+Verified against installed Codex CLI **0.164.0** (`codex exec --help` and
+`codex exec resume --help`, 2026-11-16). Full-access starts use
+`--sandbox danger-full-access`; resume uses
+`-c 'sandbox_mode="danger-full-access"'` because the resume subcommand has
+no `--sandbox` option. Both explicitly set `-c 'approval_policy="on-request"'`
+and `-c 'approvals_reviewer="auto_review"'`. The
+[official OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+documents that automatic review covers eligible approval requests; actions
+already allowed by full access do not require review. We configure review
+separately because `--approve-for-me` selects workspace-write. No approval,
+sandbox, or hook-trust bypass flag is used. Managed CLI requirements and
+host permissions can still restrict or reject the mode; report that blocker
+rather than bypassing it.
+
+The default prompts for both implementation modes require reading the task
+file, applicable repository guidance (`AGENTS.md` and `CLAUDE.md` when present), and relevant
 existing documentation before editing. When a project includes context-kit or
 its docs designate context-kit as the continuity system, follow its existing
 handoff, inventory, and verification workflow where applicable to preserve
@@ -81,7 +122,7 @@ Codex stdout is retained as JSONL, stderr is retained separately, and its
 plain-text final response is stored via `--output-last-message`. Parsed
 `turn.completed` token usage is shown when available. This integration
 does not claim a per-run dollar cap or a named tool allow/deny policy for
-Codex. Both modes preserve the normal Git repository trust check and do not
+Codex. All three modes preserve the normal Git repository trust check and do not
 skip user or project execpolicy rules.
 
 ## The contract check
@@ -146,7 +187,10 @@ The bridge now handles that itself, two ways:
 ## Publishing commits: `cc_push` and why the Bash deny stays
 
 `Bash(git push:*)` is in the deny list and stays there. The only sanctioned
-way to publish a commit through this bridge is `cc_push`.
+way to publish a commit in a Claude workflow is `cc_push`. Its implementation
+and restricted argument contract are unchanged. Separately, an explicitly
+authorized full-access Codex task can push using its unrestricted network
+and filesystem access; Claude's named deny list does not apply to Codex.
 
 Two things fall out of that:
 
@@ -175,9 +219,11 @@ created. 120s wall clock so a hung network cannot hang the tool.
 ## Recovering from a run
 
 The deny list is not a boundary (see the containment note below); the
-containment that actually holds is the cwd bound, the one-run-per-cwd
-lock and the budget cap. That leaves the question a deny list was never
-going to answer: **when a run damages something inside the cwd it was
+operational controls are cwd input validation, the one-run-per-cwd
+lock and (for Claude) the budget cap. The cwd restriction is not an OS
+filesystem sandbox; full-access Codex can operate outside it. That leaves
+the question a deny list was never going to answer: **when a run damages
+something inside the cwd it was
 legitimately given, how do we get it back?** This section is the answer.
 
 Before every `cc_run` and `cc_ask`, the bridge captures a recovery point
@@ -229,6 +275,11 @@ its own recovery points is not a recovery mechanism.
 
 ## What this server can do to this machine unattended
 
+Codex has the three permission modes documented above. In particular,
+full-access Codex has unrestricted filesystem and network access and no
+per-run dollar cap. The allow/deny policy and budget details below describe
+**Claude Code sessions**.
+
 Written before the first non-test run, and it is the thing to say yes to
 before Chris restarts the desktop app.
 
@@ -243,8 +294,8 @@ per-session cap: a `cc_ask` on the same session gets its own budget
 argument (default: inherit the prior job's), so a long session with N
 asks can spend up to N × the cap in total. Raising the ceiling itself is a
 deliberate edit to `config.py`, not something a caller can do at
-runtime. The bridge itself never elevates or loosens the tool
-permissions; there is no code path that grants more.
+runtime. Claude tool permissions stay fixed; broader Codex access requires
+the separate, explicitly selected full-access tools.
 
 Every invocation also gets a **wall-clock ceiling** — 45 minutes by
 default, up to an 8-hour ceiling in `config.py`, overridable per run
@@ -275,7 +326,7 @@ slips past the allowlist is still blocked:
 
 - `git push` (the one exception, the Dealer AI internal-docs repo, is
   CC's own session-end rule from CLAUDE.md — the bridge does not add push
-  permission anywhere).
+  permission to Claude sessions).
 - `rm`, `sudo`, `brew`, `pip`, `pip3`, `npm install`, `pnpm install`,
   `yarn install`.
 - `curl`, `wget`, `ssh`, `scp`, `rsync` — no raw network fetches.
@@ -302,9 +353,10 @@ list a real boundary you would have to remove every runner, and then the
 bridge cannot run tests, which is most of the reason it exists.
 
 Read the deny list as *makes the wrong thing awkward to do by accident*,
-not *makes it impossible to do on purpose*. Real containment is the cwd
-bound (`~/Donkey_Betz/`), the one-run-per-cwd lock and the budget cap —
-three things, not four.
+not *makes it impossible to do on purpose*. The cwd restriction
+(`~/Donkey_Betz/`) validates inputs; the one-run-per-cwd lock and Claude
+budget cap limit concurrency and cost. These are not filesystem or network
+sandbox boundaries.
 
 **Decision — 2026-09-03, Chris:** option 1 — documented, allow and deny
 lists unchanged. Written down so nobody re-opens this in six months and
@@ -323,8 +375,8 @@ re-derives the weak answer.
   The whole point of this bridge is that the allowance is written down
   before the run; a flag that turns off permission checking wholesale
   would undo that.
-- `--add-dir` outside `cwd`. The cwd bounds the read/edit surface;
-  broadening it belongs in a deliberate task, not the transport layer.
+- `--add-dir` outside `cwd`. The bridge does not request additional Claude
+  working directories; cwd validation alone is not an OS sandbox.
 
 **Enforced by the bridge, not by the CLI:**
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Only cwds under this root are allowed. Refuse anything else.
+# Only cwds under this root are allowed. Refuse anything else. This is
+# input validation, not a filesystem sandbox: codex-full-access can read/write
+# outside cwd and access the network. Its CLI policy is defined in backends.py.
 WORKSPACE_ROOT = Path.home() / "Donkey_Betz"
 
 # Where per-run logs and metadata live. Gitignored; the record that matters

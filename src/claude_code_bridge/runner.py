@@ -696,6 +696,27 @@ def start_codex_write_run(
     )
 
 
+def start_codex_full_access_run(
+    task_file: str,
+    cwd: str,
+    timeout_s: float | int | str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict:
+    """Start only explicitly authorized work with unrestricted filesystem/network access.
+
+    cwd/task-file checks validate inputs; they do not confine this backend.
+    """
+    return _start_backend_run(
+        task_file,
+        cwd,
+        backend_name="codex-full-access",
+        timeout_s=timeout_s,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+
 def _start_backend_run(
     task_file: str,
     cwd: str,
@@ -760,10 +781,19 @@ def _start_backend_run(
             "that the task file was updated."
         )
     else:
+        access_notice = (
+            "session has unrestricted filesystem and network access, including "
+            "reading/writing outside cwd, Git metadata writes, local loopback "
+            "servers, and network operations. The cwd and task-file restrictions "
+            "are input validation, not a sandbox boundary. Use this access only "
+            "for work the user explicitly authorized. "
+            if backend_name == "codex-full-access"
+            else "session has workspace-write access only within the current "
+            "project directory. "
+        )
         prompt = (
             f"Read {task_rel} and carry out the requested work. This Codex "
-            "session has workspace-write access only within the current "
-            "project directory. Keep changes within the requested scope. "
+            f"{access_notice}Keep changes within the requested scope. "
             "Do not commit, push, or publish changes unless the task "
             "explicitly asks for that. If blocked, explain the blocker "
             "instead of trying to bypass it. Before editing, read the task "
@@ -851,6 +881,8 @@ def start_ask(
     for pre-timeout jobs — same shape as budget inheritance.
     """
     _, prev_meta = _load_meta(prev_job_id)
+    if prev_meta.get("backend") == "codex-full-access":
+        raise BridgeError("use codex_full_access_ask to explicitly continue a full-access Codex job")
     if is_codex_backend(prev_meta.get("backend", "claude")):
         if budget_usd is not None:
             raise BridgeError("Codex does not support a per-run dollar budget")
@@ -1034,6 +1066,18 @@ def start_codex_write_ask(
     _, meta = _load_meta(prev_job_id)
     if meta.get("backend") != "codex-write":
         raise BridgeError("codex_write_ask can only continue a workspace-write Codex job")
+    return _start_codex_ask(prev_job_id, prompt, timeout_s=timeout_s)
+
+
+def start_codex_full_access_ask(
+    prev_job_id: str,
+    prompt: str,
+    timeout_s: float | int | str | None = None,
+) -> dict:
+    """Continue only a full-access job, for an explicitly authorized follow-up."""
+    _, meta = _load_meta(prev_job_id)
+    if meta.get("backend") != "codex-full-access":
+        raise BridgeError("codex_full_access_ask can only continue a full-access Codex job")
     return _start_codex_ask(prev_job_id, prompt, timeout_s=timeout_s)
 
 

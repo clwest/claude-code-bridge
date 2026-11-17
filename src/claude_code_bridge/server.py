@@ -1,4 +1,4 @@
-"""MCP server: six tools that drive Claude Code headless.
+"""MCP tools for headless Claude Code and opt-in Codex execution.
 
 Notes for future readers:
 
@@ -15,10 +15,9 @@ Notes for future readers:
   3. Return values are strings. Callers get plain text; there is no
      schema for the SDK to infer.
 
-  4. The permission surface is written down in config.py and in the
-     README. The server enforces it by passing the CLI's own allow/deny
-     flags on every spawn. There is no code path here that grants more
-     than that.
+  4. The permission surface is written down in config.py, backends.py,
+     and the README. Claude uses fixed allow/deny flags; Codex has separate
+     read-only, workspace-write, and explicit full-access adapters.
 """
 from __future__ import annotations
 
@@ -41,8 +40,10 @@ from .runner import (
     start_ask,
     start_codex_run,
     start_codex_write_run,
+    start_codex_full_access_run,
     start_codex_ask,
     start_codex_write_ask,
+    start_codex_full_access_ask,
     start_run,
     tail,
     wait_for_job,
@@ -123,7 +124,14 @@ server: MCPServer = MCPServer(
         "separate codex_run and codex_ask tools provide read-only Codex "
         "analysis. codex_write_run and codex_write_ask are an explicit "
         "workspace-write path for user-requested implementation; those calls "
-        "use Codex approval review and remain confined to the project. Codex "
+        "use Codex approval review with restricted network access. "
+        "codex_full_access_run and codex_full_access_ask are separately opt-in: "
+        "they allow unrestricted filesystem and network access, including "
+        "read/write outside cwd, Git metadata writes, local loopback servers, "
+        "and authorized pushes. Only call full-access tools for tasks the user "
+        "explicitly authorized. cwd and task-file restrictions are input "
+        "validation, not a sandbox boundary. Eligible approvals use automatic "
+        "review; actions already allowed by full access need no review. Codex "
         "does not have a per-run dollar cap or the Claude named tool policy. "
         "Use write tools only when the user explicitly requested changes. "
         "Shared status, wait, result, kill, and list tools accept jobs from "
@@ -291,10 +299,52 @@ def codex_write_run(
 
 
 @server.tool(
+    name="codex_full_access_run",
+    description=(
+        "Start a separately opt-in full-access Codex task. Only call for work "
+        "the user explicitly authorized. Uses danger-full-access: unrestricted "
+        "filesystem and network access, including read/write outside cwd, Git "
+        "metadata writes, local loopback servers, and explicitly authorized "
+        "pushes. cwd must be under ~/Donkey_Betz/ and task_file must be an "
+        "existing TASK_*.md under cwd; these restrictions are input validation, "
+        "not a sandbox boundary. Preserves Codex repository trust checks and "
+        "execpolicy rules. Eligible approval requests use automatic review; "
+        "actions already allowed by full access need no review. No approval "
+        "or sandbox bypass flags and no per-run dollar cap. Optional timeout_s, "
+        "model, and reasoning_effort match other Codex run tools. Use "
+        "codex_full_access_ask for authorized follow-ups; shared cc_status, "
+        "cc_wait, cc_result, cc_kill, and cc_list manage the returned job. "
+        "Do not commit, push, or publish unless the task explicitly asks."
+    ),
+    structured_output=False,
+)
+def codex_full_access_run(
+    task_file: str,
+    cwd: str,
+    timeout_s: float | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    """Start an explicitly authorized full-access Codex run."""
+    try:
+        result = start_codex_full_access_run(
+            task_file,
+            cwd,
+            timeout_s=timeout_s,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        prefix = _format_reaped(result.get("reaped", []))
+        return f"{prefix}Started Codex full-access job {result['job_id']} (danger-full-access)"
+    except Exception as exc:
+        return _friendly_error(exc)
+
+
+@server.tool(
     name="cc_status",
     description=(
-        "Report on a job started with cc_run, cc_ask, codex_run, or "
-        "codex_ask: running/finished "
+        "Report on a Claude or Codex job (read-only, workspace-write, or "
+        "full-access): running/finished "
         "(or 'finished (exit unknown)' if the wrapper died before writing "
         "the exit code), elapsed seconds, budget, and the last ~20 lines "
         "of stdout+stderr. Does not block. The numeric exit code is on "
@@ -476,6 +526,7 @@ def cc_wait(job_id: str, timeout_s: float | None = None) -> str:
         "bill). Optional `timeout_s` overrides the inherited wall-clock "
         "ceiling from the prior job (default 45 minutes, ceiling 8 "
         "hours). Returns a new job_id for the follow-up run."
+        " Full-access Codex jobs require the explicit codex_full_access_ask tool."
     ),
     structured_output=False,
 )
@@ -540,6 +591,38 @@ def codex_write_ask(
         result = start_codex_write_ask(job_id, prompt, timeout_s=timeout_s)
         prefix = _format_reaped(result.get("reaped", []))
         return f"{prefix}Started Codex write follow-up job {result['job_id']}"
+    except Exception as exc:
+        return _friendly_error(exc)
+
+
+@server.tool(
+    name="codex_full_access_ask",
+    description=(
+        "Resume only a prior full-access Codex job using its persisted thread "
+        "ID. Only call for follow-up work the user explicitly authorized. "
+        "Retains danger-full-access: unrestricted filesystem and network "
+        "access, including read/write outside cwd and authorized pushes. "
+        "cwd and task-file restrictions are input validation, not a sandbox "
+        "boundary. Preserves repository trust checks and execpolicy rules; "
+        "eligible approval requests use automatic review, while actions "
+        "already allowed by full access need no review. Cannot upgrade a "
+        "read-only or workspace-write job. No per-run dollar cap. Optional "
+        "timeout_s overrides the inherited wall-clock limit. Shared cc_status, "
+        "cc_wait, cc_result, cc_kill, and cc_list manage the new job. "
+        "Do not commit, push, or publish unless the task explicitly asks."
+    ),
+    structured_output=False,
+)
+def codex_full_access_ask(
+    job_id: str,
+    prompt: str,
+    timeout_s: float | None = None,
+) -> str:
+    """Continue an explicitly authorized full-access Codex session."""
+    try:
+        result = start_codex_full_access_ask(job_id, prompt, timeout_s=timeout_s)
+        prefix = _format_reaped(result.get("reaped", []))
+        return f"{prefix}Started Codex full-access follow-up job {result['job_id']} (danger-full-access)"
     except Exception as exc:
         return _friendly_error(exc)
 
@@ -616,9 +699,9 @@ def cc_list() -> str:
     name="cc_push",
     description=(
         "Publish the current branch's commits from `cwd` to `remote` "
-        "(default 'origin'). This is the only sanctioned way through — "
-        "the Bash(git push:*) deny in config stays as-is, same shape as "
-        "cc_kill being the only sanctioned way to end a job. Deliberately "
+        "(default 'origin'). This is the sanctioned publishing tool for "
+        "Claude workflows; the Bash(git push:*) deny in config stays as-is. "
+        "Full-access Codex separately permits explicitly authorized pushes. Deliberately "
         "no argument passthrough: --force, --force-with-lease, --delete, "
         "--tags and refspecs are unreachable from outside. Refuses cwds "
         "outside ~/Donkey_Betz/, refuses a detached HEAD, refuses a "
