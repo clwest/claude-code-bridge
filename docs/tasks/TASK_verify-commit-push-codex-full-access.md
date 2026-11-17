@@ -2,7 +2,7 @@
 title: "TASK — verify, commit, and push Codex full-access bridge mode"
 date: 2026-11-16
 for: Codex (Chat bridge)
-status: in_progress
+status: done
 ---
 
 # Goal
@@ -26,10 +26,10 @@ The full bridge test suite and diff checks pass, the feature branch is committed
 
 - [x] Requirement 1 — Read both task briefs, the complete README, applicable ancestor `CLAUDE.md`, and existing code/tests. Inspected the complete working tree, staged/unstaged diffs, branch, and upstream before editing. All eight changed/untracked files belong to this feature. This project uses README/task records; its context-kit instructions are conditional guidance for child projects, with no adopted continuity workflow found here.
 - [x] Requirement 2 — Ran `python3 -m pytest -q`: **133 passed in 84.88s (0:01:24)**, exit 0. No implementation fixes or reruns were needed.
-- [x] Requirement 3 — `git diff --check` passed. Reviewed feature code, tests, and README; the complete staged diff will be reviewed before committing. Direct comparison against starting HEAD confirmed identical Claude/read-only/workspace-write start/resume argv, unchanged safer-mode public entry points, and unchanged `push_branch` implementation. Full access is separately named and documented with explicit authorization and input-validation limits. No live full-access child job was launched.
-- [ ] Requirement 4 — Stage only the feature files and task records, review the staged diff, then commit as `feat: add explicit full-access Codex bridge mode`.
-- [ ] Requirement 5 — Push only `codex-backend-adapter` to its configured upstream `origin/codex-backend-adapter`, without force or remote changes. Live upstream was checked with `git ls-remote` and matched starting HEAD `8bc5cfc3d86a18203cf99701d80345d991cbcb5a` (0 ahead / 0 behind).
-- [ ] Requirement 6 — Verify commit, remote hash, and clean tree after pushing; record actual results and set status to `done`. A report-only follow-up commit will preserve post-push evidence without amending history.
+- [x] Requirement 3 — `git diff --check` and `git diff --cached --check` passed; reviewed the complete staged diff across all eight files before committing. Direct comparison against starting HEAD confirmed identical Claude/read-only/workspace-write start/resume argv, unchanged safer-mode public entry points, and unchanged `push_branch` implementation. Full access is separately named and documented with explicit authorization and input-validation limits. No live full-access child job was launched.
+- [x] Requirement 4 — Staged only the eight feature/task files below. Created commit `355749afea921c3829b17b57918eaf1e0d34260b` with the exact message `feat: add explicit full-access Codex bridge mode` (8 files, 542 insertions, 37 deletions). All repository actions were performed by Codex.
+- [x] Requirement 5 — Ran `git push origin codex-backend-adapter`, exit 0: `8bc5cfc..355749a codex-backend-adapter -> codex-backend-adapter`. Checked the live upstream before commit and again before push; it remained at starting HEAD `8bc5cfc3d86a18203cf99701d80345d991cbcb5a`. No force, main push, remote changes, or history rewriting.
+- [x] Requirement 6 — After pushing, verified commit/message with `git log -1`, and verified `HEAD`, configured upstream, and live `git ls-remote` hash all equaled `355749afea921c3829b17b57918eaf1e0d34260b`. `git status --porcelain=v1 --untracked-files=all` was empty; ahead/behind was `0 / 0`. Set status to `done`. This post-push evidence is preserved in a report-only follow-up commit; its final publication/hash verification is reported in the session result.
 
 Files included: `README.md`; `src/claude_code_bridge/{backends,config,runner,server}.py`; `tests/test_codex_full_access.py`; `docs/tasks/TASK_codex-full-access-mode.md`; this task report. Existing feature source, tests, README, and implementation report were preserved without edits; this verification session changes only this task report.
 
